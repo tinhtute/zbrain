@@ -670,3 +670,62 @@ fn asof_superseded_claim_with_superseded_support_still_surfaces() {
     assert_eq!(claims[0].status, CLAIM_STATUS_APPROVED);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The digest blanks `verified.*`, so a flipped signature still matches the
+/// digest. Only the signature check in the as-of trust walk can catch it.
+#[test]
+fn asof_tampered_signature_is_not_approved() {
+    let (dir, paths) = asof_paths("tampered-signature");
+    let old_id = "clm_000000000000000000000000000000cc";
+    let new_id = "clm_000000000000000000000000000000cd";
+    let early = store_at(&paths, Utc.with_ymd_and_hms(2026, 8, 1, 9, 0, 0).unwrap());
+    early
+        .write_draft(
+            "research",
+            asof_claim(old_id, "Refund policy", "refunds need a receipt\n"),
+        )
+        .unwrap();
+    early.approve("research", old_id).unwrap();
+
+    let late = store_at(&paths, Utc.with_ymd_and_hms(2026, 8, 1, 10, 0, 0).unwrap());
+    late.write_superseding_draft(
+        "research",
+        old_id,
+        asof_claim(new_id, "Manager approval", "managers approve refunds\n"),
+    )
+    .unwrap();
+    late.approve("research", new_id).unwrap();
+
+    // Tamper before the rebuild: the index validates approved claims only, so
+    // a superseded file with a bad signature still yields a clean index and
+    // the as-of walk is what must reject it.
+    let path = paths
+        .workspaces_dir
+        .join("research/wiki/projects")
+        .join(format!("{old_id}.md"));
+    let contents = std::fs::read_to_string(&path).unwrap();
+    let marker = "    sig: ";
+    let start = contents
+        .find(marker)
+        .expect("superseded claim keeps its signature")
+        + marker.len();
+    let end = start + contents[start..].find('\n').unwrap();
+    let mut signature: Vec<u8> = contents[start..end].bytes().collect();
+    signature[0] = if signature[0] == b'A' { b'B' } else { b'A' };
+    std::fs::write(
+        &path,
+        format!(
+            "{}{}{}",
+            &contents[..start],
+            String::from_utf8(signature).unwrap(),
+            &contents[end..]
+        ),
+    )
+    .unwrap();
+    rebuild(&paths);
+
+    // At 09:30 the old claim was approved and the replacement was not.
+    let response = ask_as_of(&paths, "receipt", "2026-08-01T09:30:00Z");
+    assert_gap(&response);
+    let _ = std::fs::remove_dir_all(&dir);
+}

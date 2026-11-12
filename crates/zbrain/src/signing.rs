@@ -965,6 +965,54 @@ mod tests {
     }
 
     #[test]
+    fn symlinked_key_directory_is_refused() {
+        let fx = fixture("symlink-dir");
+        let real = fx.dir.join("elsewhere/zbrain-keys");
+        KeyStore::init(
+            &Paths {
+                key_dir: real.clone(),
+                ..fx.paths.clone()
+            },
+            now(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(fx.dir.join("xdg")).unwrap();
+        std::os::unix::fs::symlink(&real, &fx.paths.key_dir).unwrap();
+        let error = KeyStore::open(&fx.paths).unwrap_err();
+        assert!(error.to_string().contains("is a symlink"), "{error}");
+    }
+
+    #[test]
+    fn loose_key_directory_mode_is_refused() {
+        let fx = fixture("loose-dir");
+        KeyStore::init(&fx.paths, now()).unwrap();
+        std::fs::set_permissions(&fx.paths.key_dir, std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let error = KeyStore::open(&fx.paths).unwrap_err();
+        assert!(error.to_string().contains("mode 755"), "{error}");
+    }
+
+    #[test]
+    fn symlinked_ancestor_inside_the_runtime_root_is_refused() {
+        let fx = fixture("symlink-ancestor");
+        let mut paths = fx.paths.clone();
+        // The literal path is outside the runtime root; a symlinked ancestor
+        // resolves it inside. Only canonicalization catches this.
+        std::fs::create_dir_all(&paths.runtime_dir).unwrap();
+        std::fs::create_dir_all(fx.dir.join("xdg")).unwrap();
+        std::os::unix::fs::symlink(&paths.runtime_dir, fx.dir.join("xdg/link")).unwrap();
+        paths.key_dir = fx.dir.join("xdg/link/zbrain-keys");
+        let error = KeyStore::init(&paths, now()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("resolves inside the runtime root"),
+            "{error}"
+        );
+        assert!(!paths.key_dir.exists());
+    }
+
+    #[test]
     fn symlinked_key_file_is_refused() {
         let fx = fixture("symlink");
         KeyStore::init(&fx.paths, now()).unwrap();

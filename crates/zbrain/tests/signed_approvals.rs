@@ -346,11 +346,20 @@ fn tampered_signature_is_rejected_by_every_surface() {
     assert_eq!(status["approved"], 0, "{status}");
     assert!(status["invalid"].as_i64().unwrap() >= 1, "{status}");
 
-    let asked = cli.run(&["ask", "tamper target"]);
-    let output = cli.stdout();
-    if asked.is_ok() {
-        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
-        assert_ne!(parsed["status"], "ready", "{output}");
+    // `ask` never serves the claim: either it fails closed on the rejected
+    // index, or it answers without the claim.
+    match cli.run(&["ask", "tamper target"]) {
+        Ok(()) => {
+            let output = cli.stdout();
+            let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+            assert_ne!(parsed["status"], "ready", "{output}");
+            let claims = parsed["claims"].as_array().cloned().unwrap_or_default();
+            assert!(
+                claims.iter().all(|claim| claim["id"] != id.as_str()),
+                "{output}"
+            );
+        }
+        Err(err) => assert!(err.to_string().contains("rejected"), "{err}"),
     }
 }
 
