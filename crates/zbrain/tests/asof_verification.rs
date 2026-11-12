@@ -12,8 +12,9 @@ use chrono::{DateTime, TimeZone, Utc};
 use zbrain::assets::extract_bundled_assets;
 use zbrain::claims::{
     claim_verification_digest, render_claim_markdown, Claim, ClaimStore, ClaimTransition,
-    CLAIM_BASIS_EVIDENCE, CLAIM_BASIS_OWNER, CLAIM_STATUS_APPROVED, CLAIM_STATUS_DRAFT,
-    CLAIM_STATUS_REVOKED, CLAIM_TRANSITION_APPROVE, CLAIM_TRANSITION_REVOKE, OKF_CLAIM_TYPE,
+    CLAIM_BASIS_DERIVED, CLAIM_BASIS_EVIDENCE, CLAIM_BASIS_OWNER, CLAIM_STATUS_APPROVED,
+    CLAIM_STATUS_DRAFT, CLAIM_STATUS_REVOKED, CLAIM_TRANSITION_APPROVE, CLAIM_TRANSITION_REVOKE,
+    OKF_CLAIM_TYPE,
 };
 use zbrain::clock::FixedClock;
 use zbrain::config::ensure_config;
@@ -491,5 +492,178 @@ fn asof_revoked_claim_with_missing_evidence_is_not_approved() {
     rebuild(&paths);
     let response = ask_as_of(&paths, "asof historical marker", "2026-08-15T00:00:00Z");
     assert_gap(&response);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Builds a revoked claim whose digest verifies over the approved view and
+/// whose terminal revoke binds it, but whose supporting-claim closure is
+/// whatever the caller supplies.
+fn forged_revoked_claim(id: &str, supporting: Vec<String>, body: &str) -> Claim {
+    let mut claim = Claim {
+        claim_type: OKF_CLAIM_TYPE.into(),
+        id: id.into(),
+        tier: "projects".into(),
+        status: CLAIM_STATUS_APPROVED.into(),
+        title: "Refund policy".into(),
+        basis: CLAIM_BASIS_DERIVED.into(),
+        created_at: "2026-01-01T00:00:00Z".into(),
+        created_by: "owner".into(),
+        verified_at: "2026-01-01T00:00:00Z".into(),
+        verified_by: "owner".into(),
+        supporting_claim_ids: supporting,
+        transitions: vec![ClaimTransition {
+            kind: CLAIM_TRANSITION_APPROVE.into(),
+            at: "2026-01-01T00:00:00Z".into(),
+            by: "owner".into(),
+            ..ClaimTransition::default()
+        }],
+        body: body.into(),
+        ..Claim::default()
+    };
+    let digest = claim_verification_digest(&claim).unwrap();
+    claim.verified_digest = digest.clone();
+    claim.status = CLAIM_STATUS_REVOKED.into();
+    claim.transitions.push(ClaimTransition {
+        kind: CLAIM_TRANSITION_REVOKE.into(),
+        at: "2099-01-01T00:00:00Z".into(),
+        by: "owner".into(),
+        prior_verification_digest: digest,
+        ..ClaimTransition::default()
+    });
+    claim
+}
+
+fn write_rendered_claim(paths: &Paths, claim: &Claim) {
+    let rendered = String::from_utf8(render_claim_markdown(claim).unwrap()).unwrap();
+    write_claim_file(paths, &claim.id, &rendered);
+}
+
+#[test]
+fn asof_forged_support_closure_is_gap() {
+    let (dir, paths) = asof_paths("forged-support");
+    // Digest and terminal transition are valid; the supporting claim does not
+    // exist. Nothing else checks support closure for non-approved rows.
+    let claim = forged_revoked_claim(
+        "clm_000000000000000000000000000000f1",
+        vec!["clm_000000000000000000000000000000ff".into()],
+        "refunds are unlimited and need no receipt\n",
+    );
+    write_rendered_claim(&paths, &claim);
+    rebuild(&paths);
+    let response = ask_as_of(&paths, "refunds", "2026-06-01T00:00:00Z");
+    assert_gap(&response);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn asof_forged_draft_support_is_gap() {
+    let (dir, paths) = asof_paths("forged-draft-support");
+    let t1 = Utc.with_ymd_and_hms(2026, 8, 5, 10, 0, 0).unwrap();
+    let support_id = "clm_000000000000000000000000000000f2";
+    store_at(&paths, t1)
+        .write_draft(
+            "research",
+            asof_claim(support_id, "Draft support", "draft support marker\n"),
+        )
+        .unwrap();
+    let claim = forged_revoked_claim(
+        "clm_000000000000000000000000000000f4",
+        vec![support_id.into()],
+        "refunds are unlimited and need no receipt\n",
+    );
+    write_rendered_claim(&paths, &claim);
+    rebuild(&paths);
+    let response = ask_as_of(&paths, "refunds", "2026-09-01T00:00:00Z");
+    assert_gap(&response);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn asof_forged_support_approved_after_as_of_is_gap() {
+    let (dir, paths) = asof_paths("forged-late-support");
+    let t3 = Utc.with_ymd_and_hms(2026, 8, 20, 10, 0, 0).unwrap();
+    let support_id = "clm_000000000000000000000000000000f3";
+    let support = asof_claim(support_id, "Base support", "asof support marker\n");
+    store_at(&paths, t3)
+        .write_draft("research", support.clone())
+        .unwrap();
+    store_at(&paths, t3)
+        .approve("research", support_id)
+        .unwrap();
+    let claim = forged_revoked_claim(
+        "clm_000000000000000000000000000000f5",
+        vec![support_id.into()],
+        "refunds are unlimited and need no receipt\n",
+    );
+    write_rendered_claim(&paths, &claim);
+    rebuild(&paths);
+    // The support was not approved yet at the requested instant.
+    let response = ask_as_of(&paths, "refunds", "2026-08-10T00:00:00Z");
+    assert_gap(&response);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn asof_superseded_claim_with_superseded_support_still_surfaces() {
+    let (dir, paths) = asof_paths("superseded-support");
+    // The support was still active at the requested instant even though it is
+    // superseded now, so the derived claim must keep surfacing.
+    let t1 = Utc.with_ymd_and_hms(2026, 8, 2, 10, 0, 0).unwrap();
+    let t2 = Utc.with_ymd_and_hms(2026, 8, 6, 10, 0, 0).unwrap();
+    let t3 = Utc.with_ymd_and_hms(2026, 8, 20, 10, 0, 0).unwrap();
+    let t4 = Utc.with_ymd_and_hms(2026, 8, 25, 10, 0, 0).unwrap();
+    let support = asof_claim(
+        "clm_000000000000000000000000000000f6",
+        "Base support",
+        "asof support marker\n",
+    );
+    store_at(&paths, t1)
+        .write_draft("research", support.clone())
+        .unwrap();
+    store_at(&paths, t1)
+        .approve("research", &support.id)
+        .unwrap();
+    let mut derived = asof_claim(
+        "clm_000000000000000000000000000000f7",
+        "Derived claim",
+        "asof historical marker\n",
+    );
+    derived.basis = CLAIM_BASIS_DERIVED.into();
+    derived.supporting_claim_ids = vec![support.id.clone()];
+    store_at(&paths, t2)
+        .write_draft("research", derived.clone())
+        .unwrap();
+    store_at(&paths, t2)
+        .approve("research", &derived.id)
+        .unwrap();
+    let support_replacement = asof_claim(
+        "clm_000000000000000000000000000000f8",
+        "Base support replacement",
+        "asof support marker replacement\n",
+    );
+    store_at(&paths, t3)
+        .write_superseding_draft("research", &support.id, support_replacement.clone())
+        .unwrap();
+    store_at(&paths, t3)
+        .approve("research", &support_replacement.id)
+        .unwrap();
+    let derived_replacement = asof_claim(
+        "clm_000000000000000000000000000000f9",
+        "Derived claim replacement",
+        "asof historical marker replacement\n",
+    );
+    store_at(&paths, t4)
+        .write_superseding_draft("research", &derived.id, derived_replacement.clone())
+        .unwrap();
+    store_at(&paths, t4)
+        .approve("research", &derived_replacement.id)
+        .unwrap();
+    rebuild(&paths);
+
+    let response = ask_as_of(&paths, "asof historical marker", "2026-08-10T00:00:00Z");
+    let claims = response.claims.as_ref().unwrap();
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].id, derived.id);
+    assert_eq!(claims[0].status, CLAIM_STATUS_APPROVED);
     let _ = std::fs::remove_dir_all(&dir);
 }
