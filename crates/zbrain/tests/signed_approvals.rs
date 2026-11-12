@@ -427,3 +427,48 @@ fn resign_is_a_noop_when_claims_are_already_signed() {
         before
     );
 }
+
+#[test]
+fn key_recover_requires_typing_the_new_key_id() {
+    let fx = fixture("recover-cli");
+    let mut cli = Cli::new(fx.paths.clone());
+    cli.run_ok(&["key", "init"]);
+    let id = draft(&mut cli, "Agent fact", "recovery keeps this claim\n");
+    approve_via_cli(&mut cli, &id);
+    let private_key = fx.paths.key_dir.join("approval.ed25519");
+    std::fs::remove_file(&private_key).unwrap();
+
+    // A wrong confirmation writes nothing.
+    cli.app.prompt = PromptSource::Scripted(vec!["0000000000000000".to_string()]);
+    let error = cli
+        .run(&["key", "init", "--recover"])
+        .expect_err("a wrong key id must be refused");
+    assert!(error.to_string().contains("key id mismatch"), "{error}");
+    assert!(!private_key.exists(), "refused recovery wrote a key");
+
+    // Typing the printed id commits, and the claim signed by the old key
+    // still verifies because that key is retired, not revoked.
+    cli.app.clock = std::sync::Arc::new(FixedClock::new(
+        Utc.with_ymd_and_hms(2026, 8, 1, 10, 0, 0).unwrap(),
+    ));
+    let printed = cli.err.clone();
+    cli.app.prompt = PromptSource::Live(Box::new(move || {
+        let text = String::from_utf8(printed.0.borrow().clone()).unwrap();
+        text.split("new key id: ")
+            .nth(1)
+            .and_then(|rest| rest.lines().next())
+            .expect("the command must print the new key id")
+            .trim()
+            .to_string()
+    }));
+    let out = cli.run_ok(&["key", "init", "--recover"]);
+    let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(parsed["recovered"], true, "{out}");
+    assert!(private_key.exists(), "committed recovery wrote no key");
+    assert_eq!(parsed["retired_key_ids"].as_array().unwrap().len(), 1);
+
+    cli.run_ok(&["reindex"]);
+    let status: serde_json::Value = serde_json::from_str(&cli.run_ok(&["status"])).unwrap();
+    assert_eq!(status["approved"], 1, "{status}");
+    assert_eq!(status["invalid"], 0, "{status}");
+}
