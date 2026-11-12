@@ -154,6 +154,10 @@ impl KeyStore {
 
     /// Plan a recovery for a lost private key. Existing claims still verify
     /// against the retired public keys; nothing is written until `commit`.
+    ///
+    /// A private key the anchor does not record is a recovery that crashed
+    /// after writing it: the rerun adopts that key instead of generating
+    /// another one, so `commit` converges on the same key id.
     pub fn recover(paths: &Paths, now: DateTime<Utc>) -> Result<KeyRecovery, KeyError> {
         let dir = paths.key_dir.clone();
         check_placement(&dir, &paths.runtime_dir)?;
@@ -165,15 +169,22 @@ impl KeyStore {
                 dir.display()
             )));
         }
-        let private_path = dir.join(PRIVATE_KEY_FILE);
-        if private_path.exists() {
-            return Err(KeyError::new(format!(
-                "the approval private key is present at {}; recovery is only for a lost key",
-                private_path.display()
-            )));
-        }
         let previous = parse_key_state(&read_checked_file(&state_path)?)?;
-        let signing_key = SigningKey::generate(&mut rand_core::OsRng);
+        let private_path = dir.join(PRIVATE_KEY_FILE);
+        let signing_key = if private_path.exists() {
+            let signing_key = signing_key_from_file(&private_path)?;
+            let key_id = key_id_for(&signing_key.verifying_key());
+            if previous.iter().any(|key| key.key_id == key_id) {
+                return Err(KeyError::new(format!(
+                    "the approval private key at {} matches key {key_id} in the anchor; \
+                     recovery is only for a lost or half-committed key",
+                    private_path.display()
+                )));
+            }
+            signing_key
+        } else {
+            SigningKey::generate(&mut rand_core::OsRng)
+        };
         let key_id = key_id_for(&signing_key.verifying_key());
         Ok(KeyRecovery {
             dir,
@@ -199,9 +210,7 @@ impl KeyStore {
             .iter()
             .find(|key| key.state == "active")
             .ok_or_else(|| KeyError::new("key state has no active key"))?;
-        let bytes = read_checked_file(&self.dir.join(PRIVATE_KEY_FILE))?;
-        let seed = decode_fixed::<SECRET_LEN>(&bytes, "private key")?;
-        let signing_key = SigningKey::from_bytes(&seed);
+        let signing_key = signing_key_from_file(&self.dir.join(PRIVATE_KEY_FILE))?;
         if key_id_for(&signing_key.verifying_key()) != active.key_id {
             return Err(KeyError::new(
                 "approval private key does not match the active public key",
@@ -216,58 +225,30 @@ impl KeyRecovery {
         &self.key_id
     }
 
-    /// Keys the recovery retires. Their claims keep verifying: a retired key
-    /// is trusted for approvals before its retirement instant.
+    /// Keys this recovery retires. Their claims keep verifying: a retired key
+    /// is trusted for approvals before its retirement instant. A key that is
+    /// already retired or revoked keeps its state and is not listed.
     pub fn retired_key_ids(&self) -> Vec<String> {
         self.previous
             .iter()
-            .filter(|key| key.state != "revoked")
+            .filter(|key| !matches!(key.state.as_str(), "retired" | "revoked"))
             .map(|key| key.key_id.clone())
             .collect()
     }
 
     /// Write the new key as active and retire every previous key at `now`.
-    /// A revoked key stays revoked: recovery is the loss path, not the
-    /// compromise path.
+    /// A revoked key stays revoked and an already-retired key keeps its
+    /// original boundary: recovery is the loss path, not the compromise path,
+    /// and it must not widen a retired key's validity window.
+    ///
+    /// The three writes are ordered private key, public key, state file. A
+    /// crash between them leaves a private key the anchor does not record, so
+    /// the next `recover` adopts it and `commit` completes the same key id;
+    /// the surfaces stay fail-closed until then.
     pub fn commit(self) -> Result<KeyInit, KeyError> {
-        let public_key = self.signing_key.verifying_key();
-        let created_at = crate::clock::rfc3339(self.now);
-        let mut entries: Vec<AnchorKey> = self
-            .previous
-            .into_iter()
-            .map(|key| {
-                if key.state == "revoked" {
-                    key
-                } else {
-                    AnchorKey {
-                        state: "retired".to_string(),
-                        retired_at: created_at.clone(),
-                        ..key
-                    }
-                }
-            })
-            .collect();
-        entries.push(AnchorKey {
-            key_id: self.key_id.clone(),
-            public_key,
-            state: "active".to_string(),
-            created_at: created_at.clone(),
-            retired_at: String::new(),
-            revoked_at: String::new(),
-        });
-        let private_key = write_key_file(
-            &self.dir,
-            PRIVATE_KEY_FILE,
-            format!("{}\n", BASE64.encode(self.signing_key.to_bytes())).as_bytes(),
-        )?;
-        let public_path = write_key_file(
-            &self.dir,
-            PUBLIC_KEY_FILE,
-            format!("{}\n", BASE64.encode(public_key.to_bytes())).as_bytes(),
-        )?;
-        // The state file is the commit marker: a crash before this rename
-        // leaves the anchor untouched and the next `recover` starts over.
-        let keys_file = write_key_file(&self.dir, KEY_STATE_FILE, &key_state_yaml(&entries))?;
+        let private_key = self.write_private_key()?;
+        let public_path = self.write_public_key()?;
+        let keys_file = self.write_state()?;
         Ok(KeyInit {
             key_id: self.key_id,
             dir: self.dir,
@@ -276,6 +257,57 @@ impl KeyRecovery {
             keys_file,
         })
     }
+
+    fn write_private_key(&self) -> Result<PathBuf, KeyError> {
+        write_key_file(
+            &self.dir,
+            PRIVATE_KEY_FILE,
+            format!("{}\n", BASE64.encode(self.signing_key.to_bytes())).as_bytes(),
+        )
+    }
+
+    fn write_public_key(&self) -> Result<PathBuf, KeyError> {
+        let public_key = self.signing_key.verifying_key();
+        write_key_file(
+            &self.dir,
+            PUBLIC_KEY_FILE,
+            format!("{}\n", BASE64.encode(public_key.to_bytes())).as_bytes(),
+        )
+    }
+
+    /// The state file is the commit marker: until this rename lands the anchor
+    /// still names the previous active key.
+    fn write_state(&self) -> Result<PathBuf, KeyError> {
+        let public_key = self.signing_key.verifying_key();
+        let created_at = crate::clock::rfc3339(self.now);
+        let mut entries: Vec<AnchorKey> = self
+            .previous
+            .iter()
+            .map(|key| match key.state.as_str() {
+                "retired" | "revoked" => key.clone(),
+                _ => AnchorKey {
+                    state: "retired".to_string(),
+                    retired_at: created_at.clone(),
+                    ..key.clone()
+                },
+            })
+            .collect();
+        entries.push(AnchorKey {
+            key_id: self.key_id.clone(),
+            public_key,
+            state: "active".to_string(),
+            created_at,
+            retired_at: String::new(),
+            revoked_at: String::new(),
+        });
+        write_key_file(&self.dir, KEY_STATE_FILE, &key_state_yaml(&entries))
+    }
+}
+
+fn signing_key_from_file(path: &Path) -> Result<SigningKey, KeyError> {
+    let bytes = read_checked_file(path)?;
+    let seed = decode_fixed::<SECRET_LEN>(&bytes, "private key")?;
+    Ok(SigningKey::from_bytes(&seed))
 }
 
 fn open_key_dir(dir: &Path, runtime_dir: &Path) -> Result<KeyStore, KeyError> {
@@ -318,13 +350,23 @@ fn init_key_dir(dir: &Path, runtime_dir: &Path, now: DateTime<Utc>) -> Result<Ke
     // The state file is the commit marker: once it exists the anchor is
     // committed, so a missing private key is real loss, not a crashed init.
     if state_path.exists() {
+        let keys = parse_key_state(&read_checked_file(&state_path)?)?;
         if private_path.exists() {
+            let key_id = key_id_for(&signing_key_from_file(&private_path)?.verifying_key());
+            if keys.iter().any(|key| key.key_id == key_id) {
+                return Err(KeyError::new(format!(
+                    "approval key already exists at {}; rotation is a separate ceremony",
+                    private_path.display()
+                )));
+            }
             return Err(KeyError::new(format!(
-                "approval key already exists at {}; rotation is a separate ceremony",
-                private_path.display()
+                "the approval private key at {} is key {key_id}, which the anchor at {} \
+                 does not record: a recovery was interrupted. Run `zbrain key init --recover` \
+                 to finish it",
+                private_path.display(),
+                state_path.display()
             )));
         }
-        let keys = parse_key_state(&read_checked_file(&state_path)?)?;
         let ids: Vec<&str> = keys.iter().map(|key| key.key_id.as_str()).collect();
         return Err(KeyError::new(format!(
             "the approval key anchor at {} records key(s) {} but the private key is gone. \
@@ -1166,8 +1208,91 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("recovery is only for a lost key"),
+                .contains("recovery is only for a lost or half-committed key"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn recovery_converges_after_a_crash_between_writes() {
+        for crash_after in ["private", "public"] {
+            let fx = fixture(&format!("crash-{crash_after}"));
+            let report = KeyStore::init(&fx.paths, now()).unwrap();
+            let mut claim = approved_claim();
+            sign_with(
+                &mut claim,
+                &signing_key_from_disk(&fx.paths),
+                &report.key_id,
+            );
+            std::fs::remove_file(fx.paths.key_dir.join(PRIVATE_KEY_FILE)).unwrap();
+
+            let later = now() + chrono::Duration::hours(1);
+            let recovery = KeyStore::recover(&fx.paths, later).unwrap();
+            let new_key_id = recovery.key_id().to_string();
+            // Stop commit after the named step: that is the on-disk state a
+            // crash at that point leaves.
+            recovery.write_private_key().unwrap();
+            if crash_after == "public" {
+                recovery.write_public_key().unwrap();
+            }
+            drop(recovery);
+
+            // Fail closed until the rerun completes.
+            if crash_after == "private" {
+                let store = KeyStore::open(&fx.paths).expect("the old anchor still loads");
+                assert!(
+                    store.active_signing_key().is_err(),
+                    "a half-written private key must not sign"
+                );
+            } else {
+                assert!(
+                    KeyStore::open(&fx.paths).is_err(),
+                    "a half-written public key must not load"
+                );
+            }
+
+            // `init` names the recovery command instead of demanding a hand
+            // deletion.
+            let error = KeyStore::init(&fx.paths, later).unwrap_err();
+            assert!(error.to_string().contains("--recover"), "{error}");
+
+            // The rerun adopts the private key on disk and converges on the
+            // same key id.
+            let rerun = KeyStore::recover(&fx.paths, later).unwrap();
+            assert_eq!(rerun.key_id(), new_key_id);
+            rerun.commit().unwrap();
+            let store = KeyStore::open(&fx.paths).unwrap();
+            verify_claim_signature(&claim, &store).expect("the retired key keeps the old claim");
+            assert_eq!(store.active_signing_key().unwrap().0, new_key_id);
+        }
+    }
+
+    #[test]
+    fn recovery_keeps_an_already_retired_key_boundary() {
+        let fx = fixture("retired-boundary");
+        let report = KeyStore::init(&fx.paths, now()).unwrap();
+        let boundary = "2026-11-12T10:30:00Z";
+        rewrite_key_state(&fx.paths, &report.key_id, "retired", boundary);
+        std::fs::remove_file(fx.paths.key_dir.join(PRIVATE_KEY_FILE)).unwrap();
+
+        let later = now() + chrono::Duration::hours(1);
+        let recovery = KeyStore::recover(&fx.paths, later).unwrap();
+        assert!(
+            recovery.retired_key_ids().is_empty(),
+            "an already retired key is not retired again"
+        );
+        recovery.commit().unwrap();
+
+        let store = KeyStore::open(&fx.paths).unwrap();
+        let old = store
+            .keys()
+            .iter()
+            .find(|key| key.key_id == report.key_id)
+            .expect("the old key stays in the anchor");
+        assert_eq!(old.state, "retired");
+        assert_eq!(
+            old.retired_at, boundary,
+            "recovery must not move an existing retirement boundary"
         );
     }
 

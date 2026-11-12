@@ -896,6 +896,8 @@ impl App {
             .map(|candidate| crate::lifecycle::ResignTarget {
                 id: candidate.id.clone(),
                 digest: candidate.digest.clone(),
+                verified_at: candidate.verified_at.clone(),
+                verified_by: candidate.verified_by.clone(),
             })
             .collect();
         let action_digest =

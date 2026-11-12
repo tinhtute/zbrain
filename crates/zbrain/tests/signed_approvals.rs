@@ -129,6 +129,17 @@ fn claim_path(fx: &Fixture, id: &str) -> PathBuf {
 /// Repro 01: no `claim draft`, no `claim approve` — write the file directly
 /// with a recomputed digest, exactly what a forger can do today.
 fn write_forged_claim(fx: &Fixture, id: &str, title: &str, body: &str) {
+    write_forged_claim_with(fx, id, title, body, "2026-01-01T00:00:00Z", "owner");
+}
+
+fn write_forged_claim_with(
+    fx: &Fixture,
+    id: &str,
+    title: &str,
+    body: &str,
+    verified_at: &str,
+    verified_by: &str,
+) {
     let mut claim = Claim {
         claim_type: OKF_CLAIM_TYPE.into(),
         id: id.into(),
@@ -138,8 +149,10 @@ fn write_forged_claim(fx: &Fixture, id: &str, title: &str, body: &str) {
         basis: CLAIM_BASIS_OWNER.into(),
         created_at: "2026-01-01T00:00:00Z".into(),
         created_by: "owner".into(),
-        verified_at: "2026-01-01T00:00:00Z".into(),
-        verified_by: "owner".into(),
+        verified_at: verified_at.into(),
+        verified_by: verified_by.into(),
+        // The transition stays pinned: only the verified block moves, which
+        // is exactly what the digest blanks.
         transitions: vec![ClaimTransition {
             kind: CLAIM_TRANSITION_APPROVE.into(),
             at: "2026-01-01T00:00:00Z".into(),
@@ -504,6 +517,8 @@ fn resign_signs_only_the_confirmed_list() {
         .map(|candidate| ResignTarget {
             id: candidate.id.clone(),
             digest: candidate.digest.clone(),
+            verified_at: candidate.verified_at.clone(),
+            verified_by: candidate.verified_by.clone(),
         })
         .collect();
     assert_eq!(listed.len(), 2);
@@ -525,6 +540,71 @@ fn resign_signs_only_the_confirmed_list() {
         assert!(
             !contents.contains("sig:"),
             "{id} was signed unseen: {contents}"
+        );
+    }
+}
+
+#[test]
+fn resign_refuses_a_claim_whose_approval_time_or_approver_changed() {
+    use zbrain::claims::ClaimStore;
+    use zbrain::lifecycle::ResignTarget;
+
+    let fx = fixture("resign-verified-block");
+    let moved = "clm_00000000000000000000000000000010";
+    let reattributed = "clm_00000000000000000000000000000011";
+    write_forged_claim(&fx, moved, "Moved", "moved body\n");
+    write_forged_claim(&fx, reattributed, "Reattributed", "reattributed body\n");
+
+    let mut cli = Cli::new(fx.paths.clone());
+    cli.run_ok(&["key", "init"]);
+    let store = ClaimStore::with_clock(fx.paths.clone(), cli.app.clock.clone());
+    let listed: Vec<ResignTarget> = store
+        .resign_candidates("research")
+        .unwrap()
+        .into_iter()
+        .map(|candidate| ResignTarget {
+            id: candidate.id.clone(),
+            digest: candidate.digest.clone(),
+            verified_at: candidate.verified_at.clone(),
+            verified_by: candidate.verified_by.clone(),
+        })
+        .collect();
+    assert_eq!(listed.len(), 2);
+
+    // The digest blanks `verified.*`, so both rewrites keep the digest the
+    // owner confirmed. Only the approval-time and approver comparison can
+    // refuse them.
+    write_forged_claim_with(
+        &fx,
+        moved,
+        "Moved",
+        "moved body\n",
+        "2026-02-02T00:00:00Z",
+        "owner",
+    );
+    write_forged_claim_with(
+        &fx,
+        reattributed,
+        "Reattributed",
+        "reattributed body\n",
+        "2026-01-01T00:00:00Z",
+        "agent",
+    );
+
+    let report = store.resign_approved("research", &listed, &[]).unwrap();
+    assert!(report.signed.is_empty(), "{report:?}");
+    assert_eq!(report.skipped.len(), 2, "{report:?}");
+    for skip in &report.skipped {
+        assert!(
+            skip.reason.contains("approval time or approver"),
+            "{report:?}"
+        );
+    }
+    for id in [moved, reattributed] {
+        let contents = std::fs::read_to_string(claim_path(&fx, id)).unwrap();
+        assert!(
+            !contents.contains("sig:"),
+            "{id} was signed after its verified block changed: {contents}"
         );
     }
 }

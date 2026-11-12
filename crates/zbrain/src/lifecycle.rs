@@ -35,16 +35,21 @@ pub struct ResignCandidate {
     pub id: String,
     pub title: String,
     pub verified_at: String,
+    pub verified_by: String,
     pub digest: String,
 }
 
-/// One (id, digest) pair the owner confirmed in the re-sign ceremony. The
-/// ceremony signs only these exact pairs: a claim written or changed while
-/// the prompt waits is reported as skipped, never signed unseen.
+/// One claim the owner confirmed in the re-sign ceremony: id, digest, and the
+/// `verified.at`/`verified.by` the listing showed. The digest blanks
+/// `verified.*`, so those two fields are compared separately; the ceremony
+/// signs only exact matches and reports anything else as skipped, never
+/// signed unseen.
 #[derive(Debug, Clone)]
 pub struct ResignTarget {
     pub id: String,
     pub digest: String,
+    pub verified_at: String,
+    pub verified_by: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -237,6 +242,7 @@ impl ClaimStore {
                 id: claim.id.clone(),
                 title: claim.title.clone(),
                 verified_at: claim.verified_at.clone(),
+                verified_by: claim.verified_by.clone(),
                 digest: claim.verified_digest.clone(),
             })
             .collect())
@@ -282,6 +288,17 @@ impl ClaimStore {
                 report.skipped.push(ResignSkip {
                     id: claim.id.clone(),
                     reason: "digest changed since the owner confirmed it".to_string(),
+                });
+                continue;
+            }
+            // The digest blanks `verified.*`, so the approval time and
+            // approver must be compared on their own: the signature binds
+            // whatever values are on disk at signing time.
+            if target.verified_at != claim.verified_at || target.verified_by != claim.verified_by {
+                report.skipped.push(ResignSkip {
+                    id: claim.id.clone(),
+                    reason: "approval time or approver changed since the owner confirmed it"
+                        .to_string(),
                 });
                 continue;
             }
