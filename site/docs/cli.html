@@ -61,6 +61,10 @@ zbrain &lt;command&gt; --help</code></pre>
           <p class="specimen__desc"><code>Usage:</code><br><code>zbrain claim draft --tier &lt;tier&gt; --title &lt;title&gt; --basis &lt;owner|evidence|derived&gt; [--evidence &lt;id&gt;]... [--support &lt;id&gt;]... [--conflicts-with &lt;id&gt;]... [--workspace &lt;name&gt;]</code><br><code>zbrain claim approve &lt;id&gt; [--workspace &lt;name&gt;]</code><br><code>zbrain claim supersede &lt;id&gt; --tier &lt;tier&gt; --title &lt;title&gt; --basis &lt;owner|evidence|derived&gt; [--evidence &lt;id&gt;]... [--support &lt;id&gt;]... [--conflicts-with &lt;id&gt;]... [--workspace &lt;name&gt;]</code><br><code>zbrain claim revoke &lt;id&gt; --reason &lt;text&gt; [--workspace &lt;name&gt;]</code><br>Manage the four-state OKF claim lifecycle.</p>
         </li>
         <li class="specimen__item">
+          <p class="specimen__term">claim approve</p>
+          <p class="specimen__desc"><code>Usage: zbrain claim approve &lt;id&gt; [--workspace &lt;name&gt;]</code><br>Promote a valid draft claim through the owner ceremony: confirm the last 16 hex characters of the action digest in an interactive TTY.</p>
+        </li>
+        <li class="specimen__item">
           <p class="specimen__term">migrate</p>
           <p class="specimen__desc"><code>Usage: zbrain migrate okf [--workspace &lt;name&gt;]</code><br>Convert legacy zbrain claim files to OKF concepts.</p>
         </li>

@@ -61,7 +61,8 @@ printf 'trusted acceptance answer\\n' | \\
     --tier projects \\
     --title 'Acceptance claim' \\
     --basis owner
-# Copy the returned id into the next command.
+# Copy the returned id into the next command. Approve runs the owner ceremony:
+# type the last 16 hex characters of the printed action digest on the terminal.
 cargo run -q -p zbrain -- claim approve <claim-id>
 cargo run -q -p zbrain -- reindex
 cargo run -q -p zbrain -- status

@@ -77,7 +77,7 @@ status: draft | approved | superseded | revoked</code></pre>
       <p>Every claim follows an explicit lifecycle: <code>draft -&gt; approved -&gt; superseded|revoked</code>.</p>
       <ul>
         <li><code>claim draft</code> writes an OKF claim candidate. The claim body is read from stdin; drafts are never trusted answer material.</li>
-        <li><code>claim approve</code> validates the claim basis and referenced evidence or supporting claims, then records <code>verified.at</code>, <code>verified.by</code>, and <code>verified.digest</code>.</li>
+        <li><code>claim approve</code> runs the owner ceremony (confirm the last 16 hex characters of the action digest on a TTY) and validates the claim basis and referenced evidence or supporting claims before recording <code>verified.at</code>, <code>verified.by</code>, and <code>verified.digest</code>.</li>
         <li>Approved claims are replaced through supersession, not in-place editing. Only valid <code>approved</code> claims enter trusted results.</li>
       </ul>
       <ul>
@@ -93,7 +93,7 @@ status: draft | approved | superseded | revoked</code></pre>
       <ul>
         <li>Evidence snapshots are immutable local copies; raw evidence is not indexed or treated as trusted instructions.</li>
       </ul>
-      <p>Claims cite snapshots by evidence ID (<code>--evidence &lt;id&gt;</code>); <code>claim approve</code> validates the claim basis and the referenced evidence or supporting claims before recording the verification digest.</p>
+      <p>Claims cite snapshots by evidence ID (<code>--evidence &lt;id&gt;</code>); <code>claim approve</code> runs the owner ceremony and validates the claim basis and the referenced evidence or supporting claims before recording the verification digest.</p>
     </section>
 
     <section>

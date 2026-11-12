@@ -1,5 +1,15 @@
 # CHANGELOG
 
+## Unreleased
+
+### Fixed
+- `claim approve` runs the owner ceremony: a piped or agent-shell caller is
+  refused, and approval requires confirming the last 16 hex characters of the
+  action digest on an interactive TTY — the same challenge/grant path as
+  `approval grant`. Scripted approve steps (`make smoke`, the audit repros)
+  drive the real ceremony through `scripts/owner-approve.py` instead of
+  bypassing it.
+
 ## 0.4.0 (2026-09-06) — Rust cutover
 
 The Go implementation is replaced by a Rust workspace with verified

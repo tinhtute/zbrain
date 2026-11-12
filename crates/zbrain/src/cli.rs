@@ -16,6 +16,7 @@ use crate::clock::{rfc3339, Clock, SystemClock};
 use crate::embedder::{rebuild_with_options, RebuildOptions};
 use crate::evidence::EvidenceStore;
 use crate::index::{approved_catalog, IndexStore, IndexSummary};
+use crate::lifecycle::ClaimMutationOptions;
 use crate::paths::Paths;
 use crate::query::{trusted_query, TrustedQueryOptions};
 use crate::setup::run_setup;
@@ -741,11 +742,38 @@ impl App {
             ));
         }
         let workspace = self.resolve_workspace(parsed.single("workspace"))?;
+        // The owner ceremony is the only approval path: refuse a piped caller
+        // before reading the claim, so a script learns nothing and mutates
+        // nothing.
+        let mut prompt = self.make_prompt()?;
+        let store = ClaimStore::with_clock(self.paths.clone(), self.clock.clone());
+        let prepare = store
+            .approve_challenge_prepare(&workspace, &parsed.rest[0])
+            .map_err(|err| CliError::failure(err.to_string()))?;
+        let prepared = store
+            .prepare_challenge(&workspace, prepare)
+            .map_err(|err| CliError::failure(err.to_string()))?;
+        let challenges =
+            crate::approval::ChallengeStore::with_clock(self.paths.clone(), self.clock.clone());
+        let granted = run_grant(
+            &challenges,
+            &prepared.challenge,
+            &workspace,
+            &mut self.stderr,
+            &mut *prompt,
+        )
+        .map_err(|err| CliError::failure(err.to_string()))?;
+        let token = granted.token;
         IndexStore::new(self.paths.clone())
             .mark_dirty(&workspace)
             .map_err(|err| CliError::failure(err.to_string()))?;
-        let claim = ClaimStore::new(self.paths.clone())
-            .approve(&workspace, &parsed.rest[0])
+        let claim = store
+            .apply_challenge(
+                &workspace,
+                &prepared.challenge.id,
+                &token,
+                ClaimMutationOptions::default(),
+            )
             .map_err(|err| CliError::failure(err.to_string()))?;
         self.write_claim_mutation(&workspace, &claim)
     }
@@ -1194,7 +1222,7 @@ impl App {
     fn print_claim_approve_help(&mut self) {
         let _ = write!(
             self.stdout,
-            "Usage: zbrain claim approve <id> [--workspace <name>]\n\nPromote a valid draft claim.\n"
+            "Usage: zbrain claim approve <id> [--workspace <name>]\n\nPromote a valid draft claim through the owner ceremony: confirm the last 16\nhex characters of the action digest in an interactive TTY.\n"
         );
     }
 
@@ -1388,6 +1416,18 @@ mod tests {
         parsed["id"].as_str().unwrap().to_string()
     }
 
+    /// Answers the owner ceremony with the digest suffix the CLI will ask for.
+    fn approve_via_cli(app: &mut App, fix: &Fixture, id: &str) -> String {
+        let store = ClaimStore::with_clock(app.paths.clone(), app.clock.clone());
+        let prepare = store.approve_challenge_prepare("research", id).unwrap();
+        let suffix = crate::approval::action_digest_suffix(
+            &crate::approval::compute_challenge_action_digest(&prepare),
+        )
+        .to_string();
+        app.prompt = PromptSource::Scripted(vec![suffix]);
+        run_ok(app, fix, &["claim", "approve", id])
+    }
+
     #[test]
     fn setup_prints_text_summary() {
         let (mut app, fix) = fixture();
@@ -1447,7 +1487,7 @@ mod tests {
         assert_eq!(parsed["deduped"], false);
 
         let id = draft_id(&mut app, &fix, "CLI Claim", "Claim body\n");
-        let out = run_ok(&mut app, &fix, &["claim", "approve", &id]);
+        let out = approve_via_cli(&mut app, &fix, &id);
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(parsed["status"], "approved");
         assert_eq!(parsed["index_fresh"], false);
@@ -1458,8 +1498,14 @@ mod tests {
         let (mut app, fix) = fixture();
         setup_research(&mut app, &fix);
         let id = draft_id(&mut app, &fix, "Original", "Original body\n");
-        run_ok(&mut app, &fix, &["claim", "approve", &id]);
-        assert!(run(&mut app, &fix, &["claim", "approve", &id]).is_err());
+        approve_via_cli(&mut app, &fix, &id);
+        app.prompt = PromptSource::Scripted(Vec::new());
+        let err = run(&mut app, &fix, &["claim", "approve", &id]).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("only draft claims can be approved"),
+            "{err}"
+        );
 
         app.stdin = Box::new(Cursor::new(b"Replacement body\n".to_vec()));
         let out = run_ok(
@@ -1481,7 +1527,7 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
-        run_ok(&mut app, &fix, &["claim", "approve", &replacement]);
+        approve_via_cli(&mut app, &fix, &replacement);
         run_ok(
             &mut app,
             &fix,
@@ -1497,11 +1543,23 @@ mod tests {
     }
 
     #[test]
+    fn claim_approve_refuses_wrong_digest() {
+        let (mut app, fix) = fixture();
+        setup_research(&mut app, &fix);
+        let id = draft_id(&mut app, &fix, "Wrong Digest", "wrong digest body\n");
+        app.prompt = PromptSource::Scripted(vec!["0000000000000000".to_string()]);
+        let err = run(&mut app, &fix, &["claim", "approve", &id]).unwrap_err();
+        assert!(err.to_string().contains("digest suffix mismatch"), "{err}");
+        let store = ClaimStore::new(app.paths.clone());
+        assert_eq!(store.read("research", &id).unwrap().status, "draft");
+    }
+
+    #[test]
     fn reindex_and_ask_ready() {
         let (mut app, fix) = fixture();
         setup_research(&mut app, &fix);
         let id = draft_id(&mut app, &fix, "Trusted Ask", "local trusted answer\n");
-        run_ok(&mut app, &fix, &["claim", "approve", &id]);
+        approve_via_cli(&mut app, &fix, &id);
         let out = run_ok(&mut app, &fix, &["reindex"]);
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(parsed["schema_version"], 1);
@@ -1744,7 +1802,7 @@ mod tests {
         let (mut app, fix) = fixture();
         setup_research(&mut app, &fix);
         let id = draft_id(&mut app, &fix, "Approved Catalog", "catalog body\n");
-        run_ok(&mut app, &fix, &["claim", "approve", &id]);
+        approve_via_cli(&mut app, &fix, &id);
         draft_id(&mut app, &fix, "Draft Catalog", "draft body\n");
         run_ok(&mut app, &fix, &["reindex"]);
         let out = run_ok(&mut app, &fix, &["status"]);

@@ -1,6 +1,6 @@
 . "$(dirname "$0")/env.sh"
 fresh viewdigest
-id=$(printf 'the deploy window is tuesday\n' | $Z claim draft --tier projects --title 'Deploy window' --basis owner | jid); $Z claim approve $id >/dev/null; $Z reindex >/dev/null
+id=$(printf 'the deploy window is tuesday\n' | $Z claim draft --tier projects --title 'Deploy window' --basis owner | jid); approve $id >/dev/null; $Z reindex >/dev/null
 sed -i 's/tuesday/friday (tampered)/' $W/wiki/projects/$id.md        # no digest recompute
 $Z reindex 2>&1 | grep -E '"rebuild_state"|"error"'
 $Z ask deploy 2>&1 | head -1

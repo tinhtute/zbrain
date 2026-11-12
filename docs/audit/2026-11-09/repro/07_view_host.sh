@@ -1,6 +1,6 @@
 . "$(dirname "$0")/env.sh"
 fresh view
-id=$(printf 'acquisition target is Acme\n' | $Z claim draft --tier projects --title 'M&A' --basis owner | jid); $Z claim approve $id >/dev/null
+id=$(printf 'acquisition target is Acme\n' | $Z claim draft --tier projects --title 'M&A' --basis owner | jid); approve $id >/dev/null
 $Z view > $S/view.out 2>&1 & pid=$!
 for i in $(seq 50); do grep -q http $S/view.out && break; sleep 0.1; done
 url=$(grep -o 'http://127.0.0.1:[0-9]*' $S/view.out | head -1)

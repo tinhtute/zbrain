@@ -49,9 +49,10 @@ query outcomes.*
    snapshot and records its metadata.
 2. `claim draft` writes an OKF claim candidate. The claim body is read from
    stdin; drafts are never trusted answer material.
-3. `claim approve` validates the claim basis and referenced evidence or
-   supporting claims, then records `verified.at`, `verified.by`, and
-   `verified.digest`.
+3. `claim approve` runs the owner ceremony: the owner confirms the last 16
+   hex characters of the action digest in an interactive TTY, and the claim
+   basis and referenced evidence or supporting claims are validated before
+   `verified.at`, `verified.by`, and `verified.digest` are recorded.
 4. `reindex` scans canonical Markdown and evidence, validates trust inputs, and
    publishes a clean or rejected disposable index without rewriting canonical
    files.
@@ -72,6 +73,8 @@ integration surfaces described in [`docs/trusted-agent-gateway-spec.md`](docs/tr
 - `zbrain approval show <challenge-id>` and `zbrain approval grant <challenge-id>`
   provide the local owner ceremony for lifecycle actions. The agent receives a
   one-time grant token; the gateway, not an HTTP endpoint, applies the mutation.
+  `zbrain claim approve` runs the same ceremony in one step: it binds the
+  challenge, walks the owner confirmation, and applies it.
 - `zbrain view` serves a read-only embedded viewer on `127.0.0.1` only.
 
 All three surfaces reuse workspace boundaries and fail-closed trust validation;
@@ -218,6 +221,8 @@ claim_json=$(printf 'The local source is authoritative.\n' | \
     --basis owner)
 claim_id=$(printf '%s' "$claim_json" | python3 -c \
   'import json,sys; print(json.load(sys.stdin)["id"])')
+# The owner ceremony prompts on the terminal: type the last 16 hex characters
+# of the printed action digest. A piped caller is refused.
 cargo run -q -p zbrain -- claim approve "$claim_id"
 cargo run -q -p zbrain -- reindex
 cargo run -q -p zbrain -- status
