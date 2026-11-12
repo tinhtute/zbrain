@@ -12,6 +12,9 @@ pub struct Paths {
     pub cwd: PathBuf,
     pub home_dir: PathBuf,
     pub runtime_dir: PathBuf,
+    /// Owner approval key directory (ADR 0002). Never under `runtime_dir`;
+    /// `signing::KeyStore` refuses that placement, symlinks, and loose modes.
+    pub key_dir: PathBuf,
     pub config_file: PathBuf,
     pub workspaces_dir: PathBuf,
     pub indexes_dir: PathBuf,
@@ -46,8 +49,10 @@ impl Paths {
             None => home.join(".zbrain"),
         };
         let runtime_dir = absolute(&runtime_dir)?;
+        let key_dir = resolve_key_dir(&home)?;
 
         Ok(Self {
+            key_dir,
             config_file: runtime_dir.join("config.yml"),
             workspaces_dir: runtime_dir.join("workspaces"),
             indexes_dir: runtime_dir.join("indexes"),
@@ -56,6 +61,19 @@ impl Paths {
             runtime_dir,
         })
     }
+}
+
+/// `$XDG_CONFIG_HOME/zbrain-keys`, falling back to `~/.config/zbrain-keys`.
+/// The same path is used on macOS and Linux (ADR 0002); there is no override
+/// beyond `XDG_CONFIG_HOME`, and no fallback inside the runtime root.
+fn resolve_key_dir(home: &Path) -> Result<PathBuf, PathsError> {
+    if let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME") {
+        let config_home = PathBuf::from(config_home);
+        if !config_home.as_os_str().is_empty() {
+            return Ok(absolute(&config_home)?.join("zbrain-keys"));
+        }
+    }
+    Ok(home.join(".config").join("zbrain-keys"))
 }
 
 #[derive(Debug)]

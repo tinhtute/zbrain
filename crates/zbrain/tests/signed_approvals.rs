@@ -226,7 +226,10 @@ fn doctor_names_the_resign_command() {
     // `doctor` reports domain findings by exiting 2 after printing the JSON.
     let result = cli.run(&["doctor"]);
     let output = cli.stdout();
-    assert!(result.is_err(), "doctor must report the unsigned claim: {output}");
+    assert!(
+        result.is_err(),
+        "doctor must report the unsigned claim: {output}"
+    );
     assert!(
         output.contains("zbrain claim resign"),
         "doctor must name the re-sign command: {output}"

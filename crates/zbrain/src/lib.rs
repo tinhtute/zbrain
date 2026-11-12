@@ -21,6 +21,7 @@ pub mod paths;
 pub mod query;
 pub mod search;
 pub mod setup;
+pub mod signing;
 pub mod term;
 pub mod transition;
 pub mod trust;

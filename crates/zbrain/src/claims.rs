@@ -63,6 +63,11 @@ pub struct Claim {
     pub verified_at: String,
     pub verified_by: String,
     pub verified_digest: String,
+    /// Approval signature (ADR 0002): `ed25519`, the key id, and the base64
+    /// signature over the approval message. Empty on legacy unsigned claims.
+    pub verified_alg: String,
+    pub verified_key_id: String,
+    pub verified_sig: String,
     pub stale_after: String,
     pub sources: Vec<ClaimSource>,
     pub evidence_ids: Vec<String>,
@@ -285,6 +290,9 @@ struct VerifiedYaml {
     at: String,
     by: String,
     digest: String,
+    alg: String,
+    key_id: String,
+    sig: String,
 }
 
 #[derive(Default)]
@@ -430,6 +438,9 @@ impl VerifiedYaml {
             at: de::string(map, "at")?,
             by: de::string(map, "by")?,
             digest: de::string(map, "digest")?,
+            alg: de::string(map, "alg")?,
+            key_id: de::string(map, "key_id")?,
+            sig: de::string(map, "sig")?,
         })
     }
 }
@@ -614,10 +625,20 @@ fn parse_legacy_claim_frontmatter(
     body: &[u8],
 ) -> Result<Claim, ClaimError> {
     let metadata = LegacyFrontmatterYaml::from_map(&parse_frontmatter_map(frontmatter)?)?;
-    let (verified_at, verified_by, verified_digest) = metadata
-        .verified
-        .map(|verified| (verified.at, verified.by, verified.digest))
-        .unwrap_or_default();
+    let (verified_at, verified_by, verified_digest, verified_alg, verified_key_id, verified_sig) =
+        metadata
+            .verified
+            .map(|verified| {
+                (
+                    verified.at,
+                    verified.by,
+                    verified.digest,
+                    verified.alg,
+                    verified.key_id,
+                    verified.sig,
+                )
+            })
+            .unwrap_or_default();
     let claim = Claim {
         schema: metadata.schema,
         claim_type: OKF_CLAIM_TYPE.to_string(),
@@ -634,6 +655,9 @@ fn parse_legacy_claim_frontmatter(
         verified_at,
         verified_by,
         verified_digest,
+        verified_alg,
+        verified_key_id,
+        verified_sig,
         stale_after: metadata.stale_after,
         sources: metadata.sources.into_iter().map(source_from_yaml).collect(),
         evidence_ids: metadata.evidence_ids,
@@ -654,6 +678,9 @@ fn parse_legacy_claim_frontmatter(
             verified_at: String::new(),
             verified_by: String::new(),
             verified_digest: String::new(),
+            verified_alg: String::new(),
+            verified_key_id: String::new(),
+            verified_sig: String::new(),
             ..claim.clone()
         };
         if validate_claim(&unsigned).is_err() {
@@ -711,6 +738,9 @@ fn parse_okf_claim_frontmatter(
         claim.verified_at = verified.at;
         claim.verified_by = verified.by;
         claim.verified_digest = verified.digest;
+        claim.verified_alg = verified.alg;
+        claim.verified_key_id = verified.key_id;
+        claim.verified_sig = verified.sig;
     }
     if metadata.zbrain.profile != ZBRAIN_TRUSTED_MEMORY_PROFILE {
         return Err(message(format!(
@@ -813,15 +843,27 @@ pub fn render_claim_markdown(claim: &Claim) -> Result<Vec<u8>, ClaimError> {
     if !claim.verified_at.is_empty()
         || !claim.verified_by.is_empty()
         || !claim.verified_digest.is_empty()
+        || !claim.verified_alg.is_empty()
+        || !claim.verified_key_id.is_empty()
+        || !claim.verified_sig.is_empty()
     {
-        metadata.push((
-            "verified",
-            Yaml::map(vec![
-                ("at", Yaml::scalar(&claim.verified_at)),
-                ("by", Yaml::scalar(&claim.verified_by)),
-                ("digest", Yaml::scalar(&claim.verified_digest)),
-            ]),
-        ));
+        let mut verified: Vec<(&str, Yaml)> = vec![
+            ("at", Yaml::scalar(&claim.verified_at)),
+            ("by", Yaml::scalar(&claim.verified_by)),
+            ("digest", Yaml::scalar(&claim.verified_digest)),
+        ];
+        // Legacy claims render byte-identically: the signature keys appear
+        // only once a claim is signed, so their digests keep verifying.
+        if !claim.verified_alg.is_empty() {
+            verified.push(("alg", Yaml::scalar(&claim.verified_alg)));
+        }
+        if !claim.verified_key_id.is_empty() {
+            verified.push(("key_id", Yaml::scalar(&claim.verified_key_id)));
+        }
+        if !claim.verified_sig.is_empty() {
+            verified.push(("sig", Yaml::scalar(&claim.verified_sig)));
+        }
+        metadata.push(("verified", Yaml::map(verified)));
     }
     metadata.push(("status", Yaml::scalar(&claim.status)));
     if !claim.stale_after.is_empty() {
@@ -993,8 +1035,37 @@ pub fn validate_claim(claim: &Claim) -> Result<(), ClaimError> {
         if claim.verified_by.trim().is_empty() {
             return Err(message("claim verified.by is required"));
         }
+        if claim.verified_by.chars().any(char::is_control) {
+            return Err(message(
+                "claim verified.by must not contain control characters",
+            ));
+        }
         if !claim.verified_digest.starts_with("sha256:") {
             return Err(message("claim verified.digest must use sha256:<hex>"));
+        }
+    }
+    let signed = !claim.verified_alg.is_empty()
+        || !claim.verified_key_id.is_empty()
+        || !claim.verified_sig.is_empty();
+    if signed {
+        if claim.verified_at.is_empty()
+            || claim.verified_by.is_empty()
+            || claim.verified_digest.is_empty()
+        {
+            return Err(message(
+                "claim verified signature requires verified.at, by, and digest",
+            ));
+        }
+        if claim.verified_alg != crate::signing::APPROVAL_ALGORITHM {
+            return Err(message("claim verified.alg must be \"ed25519\""));
+        }
+        if !crate::signing::is_approval_key_id(&claim.verified_key_id) {
+            return Err(message(
+                "claim verified.key_id must be 16 lowercase hex characters",
+            ));
+        }
+        if !crate::signing::is_approval_signature(&claim.verified_sig) {
+            return Err(message("claim verified.sig must be base64 of 64 bytes"));
         }
     }
     if !claim.stale_after.is_empty() && crate::clock::parse_rfc3339(&claim.stale_after).is_err() {
@@ -1161,6 +1232,9 @@ pub fn claim_verification_digest(claim: &Claim) -> Result<String, ClaimError> {
         verified_at: String::new(),
         verified_by: String::new(),
         verified_digest: String::new(),
+        verified_alg: String::new(),
+        verified_key_id: String::new(),
+        verified_sig: String::new(),
         ..claim.clone()
     };
     let rendered = render_claim_markdown(&unsigned)?;
