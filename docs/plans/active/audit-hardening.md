@@ -16,7 +16,7 @@ Each fix turns its repro into a failing integration test first (red), then green
 | # | Break | Fix direction | Repro → expected after fix |
 |---|---|---|---|
 | 1 | `--as-of` relabels unverified superseded/revoked files as approved (`query.rs:283-288`, `index.rs:1242-1245`, `query.rs:609-611`) | Verify digest + evidence closure for every status that can surface via `--as-of` | `04` → rejected / `gap` |
-| 3 | Approval is self-attested: keyless sha256 (`claims.rs:1157-1181`) | Sign approvals with an owner key the agent cannot read (outside `ZBRAIN_HOME`, or OS keychain); verify on rebuild + query | `01` → reindex rejects |
+| 3 | Approval is self-attested: keyless sha256 (`claims.rs:1157-1181`) | **Done** (ADR 0002): Ed25519 owner key file outside `ZBRAIN_HOME`, signature over the verified digest, verified on every trust surface; `key init` + `claim resign` migration | `01` → reindex rejects |
 | 5 | `claim approve` bypasses the TTY ceremony (`cli.rs:732-751`, `lifecycle.rs:67`) | Route through the same challenge/TTY gate as `approval grant` (`term.rs:23`) | `02` → refused from a pipe |
 | 4 | Viewer, MCP resource, `status`, `memory_status` use `verify_digests=false` (`claims.rs:1680`) | One verified read path for every trust surface | `08`, `09` → tampered claim not served as approved |
 | 2 | `--embed` never gaps (`embedder.rs:171-246`, RRF `query.rs:500-508`) | Require a lexical hit (or a similarity floor) for `ready` | `13` → `gap` |
@@ -45,3 +45,4 @@ Measure completeness/absence/supersession queries on the eval suite before phase
 ## Current state
 
 - 2026-11-09: audit + research + design imported; repros made portable and re-run green-as-broken on master. No code changes yet. Next: ADR for signed approvals (#3), then red tests for #1.
+- 2026-11-12: #3 landed (ADR 0002, commits `863fccf`..`61ab812`): approved claims carry an Ed25519 signature over the verification digest; `reindex`, `ask`, `--as-of`, `status`, viewer, and MCP reject unsigned or badly signed claims through one path. `01` now reports `approved: 0, invalid: 1, rebuild_state: rejected` and `ask` fails closed. Legacy claims need `zbrain key init` + `zbrain claim resign`; `doctor` names both. Revoke/supersede signing is a follow-up (ADR 0002 "Migration").

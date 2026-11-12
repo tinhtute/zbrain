@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### Changed (breaking: approved claims now require an owner signature)
+- An approved claim is trusted only when it carries an Ed25519 signature over
+  its verification digest, made with the owner key file from ADR 0002. The key
+  lives outside the runtime root at `$XDG_CONFIG_HOME/zbrain-keys` (fallback
+  `~/.config/zbrain-keys`), directory `0700`, files `0600`; a symlinked key
+  path, a path inside `ZBRAIN_HOME`, or a looser mode fails closed.
+  `reindex`, `ask`, `ask --as-of`, `status`, the viewer, and the MCP resources
+  reject unsigned or badly signed approved claims through one shared path.
+  **Existing approved claims are untrusted until re-signed**: run
+  `zbrain key init` once, then `zbrain claim resign` (the batch owner ceremony
+  lists every approved claim and honors `--exclude`). `doctor` names both
+  commands. Revoke and supersede transitions are not signed yet (follow-up).
+- `verified` gains `alg`, `key_id`, and `sig`. The verification digest blanks
+  all `verified.*` fields, so signing a claim never changes its digest and
+  legacy files render byte-identically.
+
 ### Fixed
 - The viewer, MCP claim resource, `status`, and `memory_status` read claims
   through one verified path: an approved claim whose canonical file was
