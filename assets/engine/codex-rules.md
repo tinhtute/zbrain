@@ -9,7 +9,7 @@ Resolve the primary workspace with `zbrain workspace current`. Use `--workspace 
 - Pass caller-controlled values as separate argv elements; never concatenate them into shell source.
 - Capture local source material with `zbrain evidence add --file "$file" --origin "$origin" [--media-type "$media_type"] [--workspace "$workspace"]`.
 - Draft OKF claim concepts from stdin with `zbrain claim draft --tier "$tier" --title "$title" --basis "$basis" [--evidence "$evidence_id"]... [--support "$support_id"]... [--conflicts-with "$conflict_id"]... [--workspace "$workspace"]`.
-- Promote valid drafts with `zbrain claim approve "$id" [--workspace "$workspace"]`.
+- Promote valid drafts only through the owner: `zbrain claim approve "$id" [--workspace "$workspace"]` needs an interactive terminal and the owner's confirmation of the last 16 hex characters of the action digest. A piped or agent-shell caller is refused; hand the draft to the owner.
 - Convert legacy claim files with `zbrain migrate okf [--workspace "$workspace"]` when needed.
 - Rebuild the derived index with `zbrain reindex [--workspace "$workspace"]`.
 - Retrieve trusted context with `zbrain ask [--workspace "$workspace"] [--include "$include"]... "$query"`.

@@ -1,6 +1,6 @@
 ---
 name: zbrain:ingest
-description: Placeholder. The runtime approves OKF claim concepts directly with `zbrain claim approve`.
+description: Placeholder. The runtime approves OKF claim concepts only through the owner ceremony (`zbrain claim approve` on an interactive terminal).
 version: "2.0.0"
 ---
 
@@ -13,6 +13,8 @@ Workspace scope is primary-only by default: resolve it with `zbrain workspace cu
 Use the CLI with each caller-controlled value as a separate argv element:
 
 ```bash
+# owner only: needs an interactive terminal and the owner's confirmation of
+# the last 16 hex characters of the action digest; an agent shell is refused
 zbrain claim approve "$id" [--workspace "$workspace"]
 zbrain reindex [--workspace "$workspace"]
 zbrain ask [--workspace "$workspace"] [--include "$include"]... "$query"
