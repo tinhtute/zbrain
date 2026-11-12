@@ -2,7 +2,7 @@
 //! (ask), canonical index binding, contradiction surfacing, temporal recall,
 //! and hybrid (RRF) retrieval over the loopback embedding sidecar.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -281,14 +281,15 @@ pub fn trusted_query(
             } else {
                 Some(query_contradictions(&canonical.contradicts))
             };
-            if temporal.as_of.is_some()
-                && (canonical.status == crate::claims::CLAIM_STATUS_SUPERSEDED
-                    || canonical.status == crate::claims::CLAIM_STATUS_REVOKED)
-            {
-                if verify_historical_claim(paths, workspace, &canonical).is_err() {
-                    continue;
+            if let Some(as_of) = temporal.as_of {
+                if canonical.status == crate::claims::CLAIM_STATUS_SUPERSEDED
+                    || canonical.status == crate::claims::CLAIM_STATUS_REVOKED
+                {
+                    if verify_historical_claim(paths, workspace, &canonical, as_of).is_err() {
+                        continue;
+                    }
+                    query_claim.status = crate::claims::CLAIM_STATUS_APPROVED.into();
                 }
-                query_claim.status = crate::claims::CLAIM_STATUS_APPROVED.into();
             }
             response
                 .claims
@@ -689,44 +690,127 @@ fn validate_indexed_claim_binding_internal(
 ///
 /// The lifecycle appends the terminal supersede/revoke transition after the
 /// approval digest was recorded, so the recorded digest covers the claim
-/// without that transition. Rebuild the approved view, recompute the digest
-/// and run the same evidence-closure check the approved path uses. Callers
-/// fail closed (drop the row) when this returns an error.
+/// without that transition. Rebuild the approved view, recompute the digest,
+/// run the same evidence-closure check the approved path uses, and verify the
+/// supporting-claim closure at the as-of instant. Callers fail closed (drop
+/// the row) when this returns an error.
 fn verify_historical_claim(
     paths: &Paths,
     workspace: &str,
     canonical: &Claim,
+    as_of: DateTime<Utc>,
 ) -> Result<(), String> {
-    if canonical.verified_digest.trim().is_empty() {
-        return Err("historical claim is missing its verification digest".into());
-    }
-    let Some(terminal) = canonical.transitions.last() else {
-        return Err("historical claim is missing its lifecycle transition".into());
+    verify_claim_trust_at(paths, workspace, canonical, as_of)?;
+    let mut visiting = HashSet::new();
+    visiting.insert(canonical.id.clone());
+    let mut verified = HashSet::new();
+    verify_support_closure(
+        paths,
+        workspace,
+        canonical,
+        as_of,
+        &mut visiting,
+        &mut verified,
+    )
+}
+
+/// Verifies one claim as trusted at `as_of`: it was active then, its digest
+/// covers the approved content, and its evidence closure verifies.
+fn verify_claim_trust_at(
+    paths: &Paths,
+    workspace: &str,
+    claim: &Claim,
+    as_of: DateTime<Utc>,
+) -> Result<(), String> {
+    let filter = TemporalFilter {
+        after: None,
+        before: None,
+        as_of: Some(as_of),
     };
-    if terminal.kind != crate::claims::CLAIM_TRANSITION_SUPERSEDE
-        && terminal.kind != crate::claims::CLAIM_TRANSITION_REVOKE
-    {
+    if !match_temporal_claim(claim, &filter) {
+        return Err(format!("claim {:?} was not active at as_of", claim.id));
+    }
+    if claim.verified_digest.trim().is_empty() {
         return Err(format!(
-            "historical claim terminal transition {:?} is not supersede or revoke",
-            terminal.kind
+            "claim {:?} is missing its verification digest",
+            claim.id
         ));
     }
-    if terminal.prior_verification_digest != canonical.verified_digest {
-        return Err("historical claim terminal transition does not bind the digest".into());
+    let mut approved = claim.clone();
+    if claim.status != crate::claims::CLAIM_STATUS_APPROVED {
+        let Some(terminal) = claim.transitions.last() else {
+            return Err(format!(
+                "claim {:?} is missing its lifecycle transition",
+                claim.id
+            ));
+        };
+        if terminal.kind != crate::claims::CLAIM_TRANSITION_SUPERSEDE
+            && terminal.kind != crate::claims::CLAIM_TRANSITION_REVOKE
+        {
+            return Err(format!(
+                "claim {:?} terminal transition {:?} is not supersede or revoke",
+                claim.id, terminal.kind
+            ));
+        }
+        if terminal.prior_verification_digest != claim.verified_digest {
+            return Err(format!(
+                "claim {:?} terminal transition does not bind the digest",
+                claim.id
+            ));
+        }
+        approved.status = crate::claims::CLAIM_STATUS_APPROVED.to_string();
+        approved.transitions.pop();
     }
-    let mut approved = canonical.clone();
-    approved.status = crate::claims::CLAIM_STATUS_APPROVED.to_string();
-    approved.transitions.pop();
     let digest = claim_verification_digest(&approved)
-        .map_err(|err| format!("compute historical verification digest: {err}"))?;
-    if digest != canonical.verified_digest {
-        return Err("historical claim verification digest mismatch".into());
+        .map_err(|err| format!("compute verification digest for {:?}: {err}", claim.id))?;
+    if digest != claim.verified_digest {
+        return Err(format!("claim {:?} verification digest mismatch", claim.id));
     }
     if !approved.evidence_ids.is_empty() {
-        let mut evidence_validator = EvidenceValidator::new(paths.clone(), workspace)
-            .map_err(|err| format!("historical claim evidence validator is unavailable: {err}"))?;
+        let mut evidence_validator =
+            EvidenceValidator::new(paths.clone(), workspace).map_err(|err| {
+                format!(
+                    "evidence validator for {:?} is unavailable: {err}",
+                    claim.id
+                )
+            })?;
         validate_claim_evidence(&mut evidence_validator, &approved)
-            .map_err(|err| format!("historical claim evidence validation failed: {err}"))?;
+            .map_err(|err| format!("evidence validation for {:?} failed: {err}", claim.id))?;
+    }
+    Ok(())
+}
+
+/// Walks the supporting-claim closure at the as-of instant: every support must
+/// have been trusted then, with a verifiable digest and evidence closure.
+fn verify_support_closure(
+    paths: &Paths,
+    workspace: &str,
+    claim: &Claim,
+    as_of: DateTime<Utc>,
+    visiting: &mut HashSet<String>,
+    verified: &mut HashSet<String>,
+) -> Result<(), String> {
+    let mut seen = HashSet::new();
+    for id in &claim.supporting_claim_ids {
+        if !seen.insert(id.clone()) {
+            return Err(format!(
+                "claim {:?} has duplicate supporting claim {id:?}",
+                claim.id
+            ));
+        }
+        if verified.contains(id) {
+            continue;
+        }
+        if !visiting.insert(id.clone()) {
+            return Err(format!("supporting claim cycle at {id:?}"));
+        }
+        let support = ClaimStore::new(paths.clone())
+            .read(workspace, id)
+            .map_err(|err| format!("load supporting claim {id:?}: {err}"))?;
+        verify_claim_trust_at(paths, workspace, &support, as_of)?;
+        verify_support_closure(paths, workspace, &support, as_of, visiting, verified)?;
+        visiting.remove(id);
+        verified.insert(id.clone());
     }
     Ok(())
 }
