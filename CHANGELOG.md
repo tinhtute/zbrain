@@ -13,7 +13,9 @@
   **Existing approved claims are untrusted until re-signed**: run
   `zbrain key init` once, then `zbrain claim resign` (the batch owner ceremony
   lists every approved claim and honors `--exclude`). `doctor` names both
-  commands. Revoke and supersede transitions are not signed yet (follow-up),
+  commands. A lost private key needs `zbrain key init --recover`, which prints
+  the new key id, writes it only when the owner types that id, and retires the
+  previous keys so existing claims keep verifying. Revoke and supersede transitions are not signed yet (follow-up),
   so a legacy superseded or revoked claim cannot be restored by re-signing:
   `claim resign` walks approved claims only, and `ask --as-of` therefore
   reports those historical rows as a gap until the follow-up signs

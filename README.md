@@ -82,9 +82,12 @@ integration surfaces described in [`docs/trusted-agent-gateway-spec.md`](docs/tr
 - `zbrain key init` creates the owner approval key (ADR 0002) at
   `$XDG_CONFIG_HOME/zbrain-keys` (fallback `~/.config/zbrain-keys`): directory
   `0700`, files `0600`, refusing symlinks, a path inside `ZBRAIN_HOME`, looser
-  modes, and an existing key. `zbrain claim resign` re-signs every approved
-  claim in one TTY ceremony, listing id, title, approval time, and digest and
-  honoring `--exclude`; claims left unsigned stay untrusted.
+  modes, and an existing key. `zbrain key init --recover` is the loss path:
+  it prints the new key id, writes the key only when the owner types that id,
+  and retires the previous keys so their claims keep verifying. `zbrain claim
+  resign` re-signs every approved claim in one TTY ceremony, listing id, title,
+  approval time, and digest and honoring `--exclude`; claims left unsigned stay
+  untrusted.
 
 All three surfaces reuse workspace boundaries and fail-closed trust validation;
 canonical Markdown and immutable evidence remain the trust inputs.
