@@ -3,6 +3,12 @@
 ## Unreleased
 
 ### Fixed
+- The viewer, MCP claim resource, `status`, and `memory_status` read claims
+  through one verified path: an approved claim whose canonical file was
+  tampered after approval is dropped or reported as invalid, never served as
+  approved. `lint`/`doctor` report invalid claims as findings. Repair and
+  owner-ceremony paths still read the canonical file so a tampered claim can
+  be revoked or migrated.
 - `claim approve` runs the owner ceremony: a piped caller is refused, and
   approval requires confirming the last 16 hex characters of the action digest
   on an interactive TTY — the same challenge/grant path as `approval grant`.

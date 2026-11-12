@@ -1,6 +1,6 @@
 //! claims.rs — port of internal/runtime/claim.go and claim_store.go (m2
 //! surface: parse/render/validate/digests/contradictions, WriteDraft, Read,
-//! ScanWorkspace/ScanWorkspaceForTrust, write-once canonical Markdown).
+//! ScanWorkspace/ScanWorkspaceTrusted, write-once canonical Markdown).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write as _;
@@ -17,9 +17,11 @@ use crate::coordination::{
     begin_canonical_mutation_unlocked, run_workspace_generation_test_hook, MutationError,
     WORKSPACE_GENERATION_HOOK_BEFORE_CANONICAL_WRITE,
 };
+use crate::evidence::{validate_claim_evidence, EvidenceValidator};
 use crate::paths::{
     ensure_directory_mode, ensure_file_mode, Paths, RUNTIME_DIRECTORY_MODE, RUNTIME_METADATA_MODE,
 };
+use crate::trust::TrustValidator;
 use crate::workspace::WIKI_TIERS;
 use crate::yaml::{self, Yaml, YamlStyle};
 
@@ -1677,8 +1679,91 @@ impl ClaimStore {
         self.scan_workspace_inner(workspace, true)
     }
 
-    pub fn scan_workspace_for_trust(&self, workspace: &str) -> Result<ClaimScan, ClaimError> {
-        self.scan_workspace_inner(workspace, false)
+    /// Verified read of every claim in a workspace: the digest, evidence
+    /// closure, and support closure rules the index rebuild applies to
+    /// approved claims. A claim that fails them is reported in
+    /// [`ClaimScan::invalid`] and never appears in [`ClaimScan::claims`].
+    pub fn scan_workspace_trusted(&self, workspace: &str) -> Result<ClaimScan, ClaimError> {
+        let mut scan = self.scan_workspace_inner(workspace, false)?;
+        let (trusted, invalid) = self.validate_trusted_claims(workspace, &scan.claims)?;
+        scan.claims = trusted;
+        scan.invalid.extend(invalid);
+        scan.invalid.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then_with(|| left.error.cmp(&right.error))
+        });
+        Ok(scan)
+    }
+
+    /// The trust rule for indexed claims: an approved claim must carry a
+    /// matching verification digest, a verified evidence closure, and a
+    /// verified support closure. Non-approved claims pass through unchanged
+    /// (drafts are promotion candidates, not trusted material). The index
+    /// rebuild, `status`, `memory_status`, and the viewer all use this one
+    /// implementation.
+    pub(crate) fn validate_trusted_claims(
+        &self,
+        workspace: &str,
+        claims: &[Claim],
+    ) -> Result<(Vec<Claim>, Vec<InvalidClaim>), ClaimError> {
+        let mut trust_validator = TrustValidator::from_store(self, workspace)?;
+        let mut evidence_validator = EvidenceValidator::new(self.paths.clone(), workspace)
+            .map_err(|err| message(err.to_string()))?;
+        let mut valid_claims = Vec::with_capacity(claims.len());
+        let mut invalid_claims: Vec<InvalidClaim> = Vec::new();
+        for claim in claims {
+            if claim.status != CLAIM_STATUS_APPROVED {
+                valid_claims.push(claim.clone());
+                continue;
+            }
+            let result = verify_claim_digest(claim)
+                .and_then(|()| validate_claim_evidence(&mut evidence_validator, claim))
+                .and_then(|()| {
+                    trust_validator
+                        .validate_claim_with_support(claim, &mut |support: &Claim| {
+                            validate_claim_evidence(&mut evidence_validator, support)
+                                .map_err(|err| err.to_string())
+                        })
+                        .map_err(|err| message(err.to_string()))
+                });
+            match result {
+                Ok(()) => valid_claims.push(claim.clone()),
+                Err(err) => invalid_claims.push(InvalidClaim {
+                    path: claim.path.clone(),
+                    error: err.to_string(),
+                }),
+            }
+        }
+        invalid_claims.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then_with(|| left.error.cmp(&right.error))
+        });
+        Ok((valid_claims, invalid_claims))
+    }
+
+    /// Verified single-claim read: [`ClaimStore::read`] plus the trust rule
+    /// for approved claims. Repair and owner-ceremony paths keep using `read`
+    /// so an owner can still revoke or migrate a tampered claim.
+    pub fn read_trusted(&self, workspace: &str, id: &str) -> Result<Claim, ClaimError> {
+        let claim = self.read(workspace, id)?;
+        if claim.status != CLAIM_STATUS_APPROVED {
+            return Ok(claim);
+        }
+        let (trusted, invalid) =
+            self.validate_trusted_claims(workspace, std::slice::from_ref(&claim))?;
+        match trusted.into_iter().next() {
+            Some(trusted) => Ok(trusted),
+            None => Err(message(format!(
+                "claim {} is not trusted: {}",
+                claim.id,
+                invalid
+                    .first()
+                    .map(|entry| entry.error.as_str())
+                    .unwrap_or("unknown reason")
+            ))),
+        }
     }
 
     pub(crate) fn scan_workspace_inner(
@@ -2683,7 +2768,7 @@ mod tests {
         );
         assert_eq!(sha256_file(&write_path), before_nested);
 
-        let trust_scan = store.scan_workspace_for_trust("research").unwrap();
+        let trust_scan = store.scan_workspace("research").unwrap();
         assert!(trust_scan.claims.is_empty());
         assert_eq!(trust_scan.invalid.len(), 2);
         let _ = std::fs::remove_dir_all(&dir);

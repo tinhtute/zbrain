@@ -12,18 +12,16 @@ use serde::Serialize;
 
 use crate::boundary::{safe_relative_path, validate_workspace, BoundaryError};
 use crate::claims::{
-    is_known_claim_status, verify_claim_digest, Claim, ClaimError, ClaimStore, InvalidClaim,
-    CLAIM_STATUS_APPROVED, CLAIM_STATUS_DRAFT, OKF_CLAIM_TYPE,
+    is_known_claim_status, Claim, ClaimError, ClaimStore, InvalidClaim, CLAIM_STATUS_APPROVED,
+    CLAIM_STATUS_DRAFT, OKF_CLAIM_TYPE,
 };
 use crate::coordination::{
     acquire_workspace_lock, ensure_workspace_generation, mark_dirty_unlocked,
     read_workspace_generation, run_workspace_generation_test_hook, validated_index_paths,
     write_workspace_generation, GenerationError,
 };
-use crate::evidence::{validate_claim_evidence, EvidenceValidator};
 use crate::manifest::{build_trust_input_manifest, TrustInputManifest};
 use crate::paths::{ensure_directory_mode, set_permissions, Paths, DERIVED_INDEX_MODE};
-use crate::trust::TrustValidator;
 use crate::workspace::WIKI_TIERS;
 use crate::{claims, index_state, transition};
 
@@ -518,7 +516,7 @@ impl IndexStore {
 
             let manifest_before = build_trust_input_manifest(&self.paths, workspace)?;
             let mut scan = ClaimStore::new(self.paths.clone())
-                .scan_workspace_for_trust(workspace)
+                .scan_workspace_inner(workspace, false)
                 .map_err(IndexError::from)?;
             run_workspace_generation_test_hook(
                 crate::coordination::WORKSPACE_GENERATION_HOOK_REBUILD_AFTER_SCAN,
@@ -527,8 +525,9 @@ impl IndexStore {
             if !same_trust_input_manifest(&manifest_before, &manifest) {
                 return msg("trust inputs changed during rebuild");
             }
-            let (valid_claims, dependency_invalid) =
-                validate_approved_claims_for_rebuild(&self.paths, workspace, &scan.claims)?;
+            let (valid_claims, dependency_invalid) = ClaimStore::new(self.paths.clone())
+                .validate_trusted_claims(workspace, &scan.claims)
+                .map_err(IndexError::from)?;
             scan.claims = valid_claims;
             scan.invalid.extend(dependency_invalid);
             scan.invalid.sort_by(|left, right| {
@@ -1225,56 +1224,6 @@ fn write_trust_directories(
         })?;
     }
     Ok(())
-}
-
-fn validate_approved_claims_for_rebuild(
-    paths: &Paths,
-    workspace: &str,
-    claims: &[Claim],
-) -> Result<(Vec<Claim>, Vec<InvalidClaim>), IndexError> {
-    let mut validator = TrustValidator::from_store(&ClaimStore::new(paths.clone()), workspace)
-        .map_err(IndexError::from)?;
-    let mut evidence_validator = EvidenceValidator::new(paths.clone(), workspace)
-        .map_err(|err| IndexError::Message(err.to_string()))?;
-    let mut valid_claims = Vec::with_capacity(claims.len());
-    let mut invalid_claims: Vec<InvalidClaim> = Vec::new();
-    for claim in claims {
-        if claim.status != CLAIM_STATUS_APPROVED {
-            valid_claims.push(claim.clone());
-            continue;
-        }
-        if let Err(err) = verify_claim_digest(claim) {
-            invalid_claims.push(InvalidClaim {
-                path: claim.path.clone(),
-                error: err.to_string(),
-            });
-            continue;
-        }
-        if let Err(err) = validate_claim_evidence(&mut evidence_validator, claim) {
-            invalid_claims.push(InvalidClaim {
-                path: claim.path.clone(),
-                error: err.to_string(),
-            });
-            continue;
-        }
-        let result = validator.validate_claim_with_support(claim, &mut |support: &Claim| {
-            validate_claim_evidence(&mut evidence_validator, support).map_err(|err| err.to_string())
-        });
-        if let Err(err) = result {
-            invalid_claims.push(InvalidClaim {
-                path: claim.path.clone(),
-                error: err.to_string(),
-            });
-            continue;
-        }
-        valid_claims.push(claim.clone());
-    }
-    invalid_claims.sort_by(|left, right| {
-        left.path
-            .cmp(&right.path)
-            .then_with(|| left.error.cmp(&right.error))
-    });
-    Ok((valid_claims, invalid_claims))
 }
 
 pub fn same_trust_input_manifest(left: &TrustInputManifest, right: &TrustInputManifest) -> bool {

@@ -25,7 +25,7 @@ pub fn structural_findings_at(
     let _lock = crate::coordination::acquire_workspace_lock(paths, workspace, false)
         .map_err(crate::claims::message)?;
 
-    let scan = ClaimStore::new(paths.clone()).scan_workspace_for_trust(workspace)?;
+    let scan = ClaimStore::new(paths.clone()).scan_workspace(workspace)?;
     let mut claim_ids: HashSet<String> = HashSet::new();
     let mut cited_evidence: HashSet<String> = HashSet::new();
     for claim in &scan.claims {
@@ -79,6 +79,13 @@ pub fn structural_findings_at(
                 }
             }
         }
+    }
+
+    for invalid in &scan.invalid {
+        findings.push(format!(
+            "claim {} is invalid: {}",
+            invalid.path, invalid.error
+        ));
     }
 
     let (evidence_ids, sha_by_id) = list_evidence_snapshots(paths, workspace)?;

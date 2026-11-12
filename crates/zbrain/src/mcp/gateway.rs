@@ -295,8 +295,7 @@ impl ZbrainRegistry {
                 workspace: workspace.clone(),
                 ..Default::default()
             };
-            if let Ok(scan) =
-                ClaimStore::new(self.paths.clone()).scan_workspace_for_trust(&workspace)
+            if let Ok(scan) = ClaimStore::new(self.paths.clone()).scan_workspace_trusted(&workspace)
             {
                 summary.approved = scan.claims.len() as i64;
                 summary.invalid = scan.invalid.len() as i64;
@@ -848,7 +847,7 @@ impl ZbrainRegistry {
         id: &str,
     ) -> Option<ReadResourceResult> {
         let claim = ClaimStore::new(self.paths.clone())
-            .read(workspace, id)
+            .read_trusted(workspace, id)
             .ok()?;
         Some(ReadResourceResult::text(
             uri,
