@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::boundary::{resolve_workspace_path, safe_relative_path, validate_workspace};
 use crate::claims::{
-    parse_claim_markdown, verify_claim_digest, Claim, ClaimSource, ClaimStore, Contradiction,
+    claim_verification_digest, parse_claim_markdown, verify_claim_digest, Claim, ClaimSource,
+    ClaimStore, Contradiction,
 };
 use crate::coordination::{
     acquire_workspace_lock, run_workspace_generation_test_hook,
@@ -284,6 +285,9 @@ pub fn trusted_query(
                 && (canonical.status == crate::claims::CLAIM_STATUS_SUPERSEDED
                     || canonical.status == crate::claims::CLAIM_STATUS_REVOKED)
             {
+                if verify_historical_claim(paths, workspace, &canonical).is_err() {
+                    continue;
+                }
                 query_claim.status = crate::claims::CLAIM_STATUS_APPROVED.into();
             }
             response
@@ -677,6 +681,52 @@ fn validate_indexed_claim_binding_internal(
                     indexed.id
                 ))
             })?;
+    }
+    Ok(())
+}
+
+/// Verifies a superseded or revoked claim as it stood when it was approved.
+///
+/// The lifecycle appends the terminal supersede/revoke transition after the
+/// approval digest was recorded, so the recorded digest covers the claim
+/// without that transition. Rebuild the approved view, recompute the digest
+/// and run the same evidence-closure check the approved path uses. Callers
+/// fail closed (drop the row) when this returns an error.
+fn verify_historical_claim(
+    paths: &Paths,
+    workspace: &str,
+    canonical: &Claim,
+) -> Result<(), String> {
+    if canonical.verified_digest.trim().is_empty() {
+        return Err("historical claim is missing its verification digest".into());
+    }
+    let Some(terminal) = canonical.transitions.last() else {
+        return Err("historical claim is missing its lifecycle transition".into());
+    };
+    if terminal.kind != crate::claims::CLAIM_TRANSITION_SUPERSEDE
+        && terminal.kind != crate::claims::CLAIM_TRANSITION_REVOKE
+    {
+        return Err(format!(
+            "historical claim terminal transition {:?} is not supersede or revoke",
+            terminal.kind
+        ));
+    }
+    if terminal.prior_verification_digest != canonical.verified_digest {
+        return Err("historical claim terminal transition does not bind the digest".into());
+    }
+    let mut approved = canonical.clone();
+    approved.status = crate::claims::CLAIM_STATUS_APPROVED.to_string();
+    approved.transitions.pop();
+    let digest = claim_verification_digest(&approved)
+        .map_err(|err| format!("compute historical verification digest: {err}"))?;
+    if digest != canonical.verified_digest {
+        return Err("historical claim verification digest mismatch".into());
+    }
+    if !approved.evidence_ids.is_empty() {
+        let mut evidence_validator = EvidenceValidator::new(paths.clone(), workspace)
+            .map_err(|err| format!("historical claim evidence validator is unavailable: {err}"))?;
+        validate_claim_evidence(&mut evidence_validator, &approved)
+            .map_err(|err| format!("historical claim evidence validation failed: {err}"))?;
     }
     Ok(())
 }
