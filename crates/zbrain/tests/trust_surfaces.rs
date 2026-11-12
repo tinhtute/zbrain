@@ -187,6 +187,7 @@ fn registry(fx: &Fixture) -> ZbrainRegistry {
 fn status_json(fx: &Fixture) -> serde_json::Value {
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_zbrain"))
         .env("ZBRAIN_HOME", &fx.paths.runtime_dir)
+        .env("XDG_CONFIG_HOME", fx.paths.key_dir.parent().unwrap())
         .args(["status", "--workspace", "research"])
         .output()
         .unwrap();

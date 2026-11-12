@@ -1809,7 +1809,7 @@ impl ClaimStore {
             }
             .map_err(|err| message(format!("approval signature: {err}")));
             let result = verify_claim_digest(claim)
-                .and_then(|()| signature)
+                .and(signature)
                 .and_then(|()| validate_claim_evidence(&mut evidence_validator, claim))
                 .and_then(|()| {
                     trust_validator

@@ -219,9 +219,16 @@ fn forged_approved_claim_is_rejected() {
 #[test]
 fn doctor_names_the_resign_command() {
     let fx = fixture("doctor");
+    // A legacy approved claim: valid digest, no signature. This is what every
+    // workspace looks like on the upgrade, and what the re-sign ceremony fixes.
+    write_forged_claim(
+        &fx,
+        "clm_00000000000000000000000000000002",
+        "Legacy approved fact",
+        "approved before signatures existed",
+    );
     let mut cli = Cli::new(fx.paths.clone());
-    let id = draft(&mut cli, "Agent fact", "agent wrote this\n");
-    approve_via_cli(&mut cli, &id);
+    cli.run_ok(&["key", "init"]);
     cli.run_ok(&["reindex"]);
 
     // `doctor` reports domain findings by exiting 2 after printing the JSON.
@@ -249,4 +256,174 @@ fn claim_approve_records_a_signature() {
     assert!(contents.contains("alg: ed25519"), "{contents}");
     assert!(contents.contains("key_id: "), "{contents}");
     assert!(contents.contains("sig: "), "{contents}");
+}
+
+fn resign_via_cli(cli: &mut Cli, excludes: &[&str]) -> String {
+    use zbrain::approval::{
+        action_digest_suffix, compute_challenge_action_digest, ChallengeItem, ChallengePrepare,
+    };
+    use zbrain::claims::ClaimStore;
+    let store = ClaimStore::with_clock(cli.app.paths.clone(), cli.app.clock.clone());
+    let candidates = store.resign_candidates("research").unwrap();
+    let items: Vec<ChallengeItem> = candidates
+        .iter()
+        .filter(|candidate| !excludes.contains(&candidate.id.as_str()))
+        .map(|candidate| ChallengeItem {
+            claim_id: candidate.id.clone(),
+            canonical_draft_digest: candidate.digest.clone(),
+        })
+        .collect();
+    let digest = compute_challenge_action_digest(&ChallengePrepare {
+        workspace: "research".to_string(),
+        operation: "resign".to_string(),
+        items,
+        ..ChallengePrepare::default()
+    });
+    cli.app.prompt = PromptSource::Scripted(vec![action_digest_suffix(&digest).to_string()]);
+    let mut argv = vec!["claim", "resign"];
+    for id in excludes {
+        argv.push("--exclude");
+        argv.push(id);
+    }
+    cli.run_ok(&argv)
+}
+
+#[test]
+fn signed_claim_is_trusted_end_to_end() {
+    let fx = fixture("trusted");
+    let mut cli = Cli::new(fx.paths.clone());
+    cli.run_ok(&["key", "init"]);
+    let id = draft(&mut cli, "Agent fact", "signed trusted answer\n");
+    approve_via_cli(&mut cli, &id);
+    cli.run_ok(&["reindex"]);
+
+    let asked: serde_json::Value =
+        serde_json::from_str(&cli.run_ok(&["ask", "signed trusted"])).unwrap();
+    assert_eq!(asked["status"], "ready", "{asked}");
+    assert_eq!(asked["claims"][0]["id"], id.as_str());
+
+    let status: serde_json::Value = serde_json::from_str(&cli.run_ok(&["status"])).unwrap();
+    assert_eq!(status["approved"], 1, "{status}");
+    assert_eq!(status["invalid"], 0, "{status}");
+    cli.run_ok(&["doctor"]);
+}
+
+#[test]
+fn tampered_signature_is_rejected_by_every_surface() {
+    let fx = fixture("tampered-sig");
+    let mut cli = Cli::new(fx.paths.clone());
+    cli.run_ok(&["key", "init"]);
+    let id = draft(&mut cli, "Agent fact", "tamper target answer\n");
+    approve_via_cli(&mut cli, &id);
+
+    let path = claim_path(&fx, &id);
+    let contents = std::fs::read_to_string(&path).unwrap();
+    let marker = "    sig: ";
+    let start = contents.find(marker).unwrap() + marker.len();
+    let mut sig: Vec<u8> = contents[start..]
+        .chars()
+        .take_while(|c| *c != '\n')
+        .map(|c| c as u8)
+        .collect();
+    // Flip one base64 character to a different valid one.
+    sig[0] = if sig[0] == b'A' { b'B' } else { b'A' };
+    let tampered = format!(
+        "{}{}{}",
+        &contents[..start],
+        String::from_utf8(sig).unwrap(),
+        &contents[start + contents[start..].chars().take_while(|c| *c != '\n').count()..]
+    );
+    std::fs::write(&path, tampered).unwrap();
+
+    let summary = IndexStore::new(fx.paths.clone())
+        .rebuild("research")
+        .unwrap();
+    assert!(summary.invalid >= 1, "{summary:?}");
+    assert_eq!(summary.rebuild_state, REBUILD_STATUS_REJECTED);
+    assert_eq!(summary.approved, 0);
+
+    let status: serde_json::Value = serde_json::from_str(&cli.run_ok(&["status"])).unwrap();
+    assert_eq!(status["approved"], 0, "{status}");
+    assert!(status["invalid"].as_i64().unwrap() >= 1, "{status}");
+
+    let asked = cli.run(&["ask", "tamper target"]);
+    let output = cli.stdout();
+    if asked.is_ok() {
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_ne!(parsed["status"], "ready", "{output}");
+    }
+}
+
+#[test]
+fn claim_approve_without_a_key_fails_before_the_ceremony() {
+    let fx = fixture("no-key");
+    let mut cli = Cli::new(fx.paths.clone());
+    let id = draft(&mut cli, "Agent fact", "no key answer\n");
+    let error = cli
+        .run(&["claim", "approve", &id])
+        .expect_err("approve must fail without a key");
+    assert!(
+        error.to_string().contains("signing key unavailable"),
+        "{error}"
+    );
+    let contents = std::fs::read_to_string(claim_path(&fx, &id)).unwrap();
+    assert!(contents.contains("status: draft"), "{contents}");
+}
+
+#[test]
+fn resign_batch_signs_legacy_claims_and_honors_exclusions() {
+    let fx = fixture("resign");
+    let keep = "clm_0000000000000000000000000000000a";
+    let exclude = "clm_0000000000000000000000000000000b";
+    write_forged_claim(&fx, keep, "Legacy keep", "legacy keep body\n");
+    write_forged_claim(&fx, exclude, "Legacy exclude", "legacy exclude body\n");
+
+    let mut cli = Cli::new(fx.paths.clone());
+    cli.run_ok(&["key", "init"]);
+    let out = resign_via_cli(&mut cli, &[exclude]);
+    let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(report["signed"], serde_json::json!([keep]), "{report}");
+    assert_eq!(report["excluded"], serde_json::json!([exclude]), "{report}");
+
+    let summary = IndexStore::new(fx.paths.clone())
+        .rebuild("research")
+        .unwrap();
+    assert_eq!(summary.approved, 1, "{summary:?}");
+    assert_eq!(summary.invalid, 1, "{summary:?}");
+    let kept = std::fs::read_to_string(claim_path(&fx, keep)).unwrap();
+    assert!(kept.contains("sig: "), "{kept}");
+    let skipped = std::fs::read_to_string(claim_path(&fx, exclude)).unwrap();
+    assert!(!skipped.contains("sig:"), "{skipped}");
+
+    let doctor = cli.run(&["doctor"]);
+    let output = cli.stdout();
+    assert!(doctor.is_err(), "{output}");
+    assert!(
+        output.contains("1 approved claims are unsigned"),
+        "{output}"
+    );
+}
+
+#[test]
+fn resign_is_a_noop_when_claims_are_already_signed() {
+    let fx = fixture("resign-idempotent");
+    let id = "clm_0000000000000000000000000000000c";
+    write_forged_claim(&fx, id, "Legacy claim", "legacy body\n");
+    let mut cli = Cli::new(fx.paths.clone());
+    cli.run_ok(&["key", "init"]);
+    resign_via_cli(&mut cli, &[]);
+    let before = std::fs::read_to_string(claim_path(&fx, id)).unwrap();
+
+    let out = resign_via_cli(&mut cli, &[]);
+    let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(report["signed"], serde_json::json!([]), "{report}");
+    assert_eq!(
+        report["already_signed"],
+        serde_json::json!([id]),
+        "{report}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(claim_path(&fx, id)).unwrap(),
+        before
+    );
 }

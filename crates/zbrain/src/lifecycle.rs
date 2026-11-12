@@ -29,6 +29,29 @@ use crate::transition::{
 };
 use crate::trust::TrustValidator;
 
+/// One approved claim listed by the batch re-sign ceremony.
+#[derive(Debug, Clone, Serialize)]
+pub struct ResignCandidate {
+    pub id: String,
+    pub title: String,
+    pub verified_at: String,
+    pub digest: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResignSkip {
+    pub id: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ResignReport {
+    pub signed: Vec<String>,
+    pub already_signed: Vec<String>,
+    pub excluded: Vec<String>,
+    pub skipped: Vec<ResignSkip>,
+}
+
 /// Provenance for callers that execute a lifecycle transition through a
 /// prepared owner challenge. Empty options keep the existing CLI owner
 /// provenance and serialized shape.
@@ -192,6 +215,85 @@ impl ClaimStore {
         run_workspace_generation_test_hook(WORKSPACE_GENERATION_HOOK_BEFORE_CANONICAL_WRITE);
         self.write_existing(workspace, &plan.claim)?;
         Ok(plan.claim)
+    }
+
+    /// Approved claims the batch re-sign ceremony will walk, in path order.
+    pub fn resign_candidates(&self, workspace: &str) -> Result<Vec<ResignCandidate>, ClaimError> {
+        let scan = self.scan_workspace_inner(workspace, false)?;
+        Ok(scan
+            .claims
+            .iter()
+            .filter(|claim| claim.status == CLAIM_STATUS_APPROVED)
+            .map(|claim| ResignCandidate {
+                id: claim.id.clone(),
+                title: claim.title.clone(),
+                verified_at: claim.verified_at.clone(),
+                digest: claim.verified_digest.clone(),
+            })
+            .collect())
+    }
+
+    /// Sign every approved claim except `excludes` with the active owner key.
+    /// Re-running is a no-op: a claim already carrying the active key's
+    /// signature is reported as already signed and the file is not rewritten.
+    pub fn resign_approved(
+        &self,
+        workspace: &str,
+        excludes: &[String],
+    ) -> Result<ResignReport, ClaimError> {
+        let keys = crate::signing::KeyStore::open(&self.paths)
+            .map_err(|err| message(format!("approval signing key unavailable: {err}")))?;
+        let _lock = crate::coordination::acquire_workspace_lock(&self.paths, workspace, true)
+            .map_err(message)?;
+        recover_pending_transition_for_mutation_unlocked(&self.paths, workspace)
+            .map_err(message)?;
+        let scan = self.scan_workspace_inner(workspace, false)?;
+        let mut report = ResignReport::default();
+        let mut pending: Vec<Claim> = Vec::new();
+        for claim in scan
+            .claims
+            .iter()
+            .filter(|claim| claim.status == CLAIM_STATUS_APPROVED)
+        {
+            if excludes.iter().any(|id| id == &claim.id) {
+                report.excluded.push(claim.id.clone());
+                continue;
+            }
+            if let Err(err) = verify_claim_digest(claim) {
+                report.skipped.push(ResignSkip {
+                    id: claim.id.clone(),
+                    reason: err.to_string(),
+                });
+                continue;
+            }
+            let mut signed = claim.clone();
+            crate::signing::sign_claim(&mut signed, &keys)
+                .map_err(|err| message(format!("sign claim {}: {err}", claim.id)))?;
+            if signed.verified_alg == claim.verified_alg
+                && signed.verified_key_id == claim.verified_key_id
+                && signed.verified_sig == claim.verified_sig
+            {
+                report.already_signed.push(claim.id.clone());
+                continue;
+            }
+            pending.push(signed);
+        }
+        for id in excludes {
+            if !report.excluded.contains(id) {
+                report.skipped.push(ResignSkip {
+                    id: id.clone(),
+                    reason: "no approved claim with this id".to_string(),
+                });
+            }
+        }
+        if !pending.is_empty() {
+            begin_canonical_mutation_unlocked(&self.paths, workspace).map_err(message)?;
+            for claim in &pending {
+                self.write_existing(workspace, claim)?;
+                report.signed.push(claim.id.clone());
+            }
+        }
+        Ok(report)
     }
 
     pub fn revoke(&self, workspace: &str, id: &str, reason: &str) -> Result<Claim, ClaimError> {
