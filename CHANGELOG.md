@@ -25,6 +25,13 @@
   legacy files render byte-identically.
 
 ### Fixed
+- `ask` checks a returned claim's declared `conflicts_with` targets against the
+  whole workspace, not only the returned page. An approved conflicting claim
+  that ranks outside the top-N now blocks the answer instead of leaving it
+  `ready`. The target must pass the same trust rule as a returned claim
+  (manifest binding, digest, owner signature, evidence closure, and the
+  `--as-of` instant), so an unverified or unsigned target neither blocks nor
+  unblocks. Covers MCP `memory_ask` and `ask --as-of`.
 - `ask --embed` no longer answers `ready` from a vector that has nothing to do
   with the query. Vector results now count as evidence only when they share a
   meaningful token (a non-stopword of three or more characters) with the query;
