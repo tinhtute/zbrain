@@ -315,7 +315,15 @@ fn key_allows_at(key: &AnchorKey, verified_at: &str) -> Result<(), KeyError> {
     let boundary = match key.state.as_str() {
         "active" => return Ok(()),
         "retired" => &key.retired_at,
-        "revoked" => &key.revoked_at,
+        // A revoked key is compromised: no claim it signed is trusted, at any
+        // time. ADR 0002 "Key rotation and loss": every claim signed by a
+        // revoked key becomes unsigned until re-signed after owner review.
+        "revoked" => {
+            return Err(KeyError::new(format!(
+                "claim is signed by revoked key {}; re-sign it after owner review",
+                key.key_id
+            )))
+        }
         other => {
             return Err(KeyError::new(format!(
                 "key {} state {other:?} is not supported",
@@ -892,18 +900,23 @@ mod tests {
     }
 
     #[test]
-    fn revoked_key_rejects_approvals_after_revocation() {
+    fn revoked_key_rejects_every_claim_it_signed() {
         let fx = fixture("revoked");
         let report = KeyStore::init(&fx.paths, now()).unwrap();
-        rewrite_key_state(&fx.paths, &report.key_id, "revoked", "2026-11-12T11:00:00Z");
-        let store = KeyStore::open(&fx.paths).unwrap();
         let mut claim = approved_claim();
         sign_with(
             &mut claim,
             &signing_key_from_disk(&fx.paths),
             &report.key_id,
         );
-        verify_claim_signature(&claim, &store).unwrap();
+        rewrite_key_state(&fx.paths, &report.key_id, "revoked", "2026-11-12T11:00:00Z");
+        let store = KeyStore::open(&fx.paths).unwrap();
+
+        // Signed before the revocation instant: still untrusted, because a
+        // compromised key can backdate. ADR 0002 "Compromise".
+        claim.verified_at = "2026-11-12T10:00:00Z".into();
+        let error = verify_claim_signature(&claim, &store).unwrap_err();
+        assert!(error.to_string().contains("revoked"), "{error}");
 
         claim.verified_at = "2026-11-12T11:00:00Z".into();
         let error = verify_claim_signature(&claim, &store).unwrap_err();
