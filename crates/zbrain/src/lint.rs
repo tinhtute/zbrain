@@ -343,4 +343,52 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn structural_findings_report_tampered_approved_claim() {
+        let (dir, paths, clock) = fixture("tampered");
+        let store =
+            crate::claims::ClaimStore::with_clock(paths.clone(), std::sync::Arc::new(clock));
+        let draft = store.write_draft("research", valid_owner_claim()).unwrap();
+        let approved = store.approve("research", &draft.id).unwrap();
+        assert_eq!(approved.status, "approved");
+
+        // A draft that cites the approved claim as support: while the claim is
+        // trusted the id resolves, so lint has nothing to report about it.
+        let mut citing = valid_owner_claim();
+        citing.id = "clm_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into();
+        citing.supporting_claim_ids = vec![approved.id.clone()];
+        store.write_draft("research", citing).unwrap();
+        let clean = structural_findings(&paths, "research").unwrap();
+        assert!(
+            !clean.join("\n").contains("references missing"),
+            "{clean:?}"
+        );
+
+        // Tamper the approved body without recomputing the digest (repro 08).
+        let path = paths
+            .workspaces_dir
+            .join("research/wiki")
+            .join(&approved.path);
+        let contents = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, contents.replace("Body", "Tampered body")).unwrap();
+
+        let findings = structural_findings(&paths, "research").unwrap();
+        let joined = findings.join("\n");
+        assert!(
+            joined.contains(&format!(
+                "claim {} is invalid: verification digest mismatch",
+                approved.path
+            )),
+            "{findings:?}"
+        );
+        assert!(
+            joined.contains(&format!(
+                "supporting_claim_ids references missing {}",
+                approved.id
+            )),
+            "{findings:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
