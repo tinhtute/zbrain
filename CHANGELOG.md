@@ -13,7 +13,11 @@
   **Existing approved claims are untrusted until re-signed**: run
   `zbrain key init` once, then `zbrain claim resign` (the batch owner ceremony
   lists every approved claim and honors `--exclude`). `doctor` names both
-  commands. Revoke and supersede transitions are not signed yet (follow-up).
+  commands. Revoke and supersede transitions are not signed yet (follow-up),
+  so a legacy superseded or revoked claim cannot be restored by re-signing:
+  `claim resign` walks approved claims only, and `ask --as-of` therefore
+  reports those historical rows as a gap until the follow-up signs
+  transitions.
 - `verified` gains `alg`, `key_id`, and `sig`. The verification digest blanks
   all `verified.*` fields, so signing a claim never changes its digest and
   legacy files render byte-identically.
