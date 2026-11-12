@@ -49,12 +49,13 @@ fn fixture(name: &str) -> Fixture {
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let paths = Paths::resolve(Options {
+    let mut paths = Paths::resolve(Options {
         cwd: Some(dir.join("project")),
         home_dir: Some(dir.clone()),
         runtime_dir: Some(dir.join(".zbrain")),
     })
     .unwrap();
+    paths.key_dir = dir.join("xdg/zbrain-keys");
     ensure_config(&paths.config_file).unwrap();
     extract_bundled_assets(&paths).unwrap();
     create_workspace(
@@ -63,6 +64,8 @@ fn fixture(name: &str) -> Fixture {
         &FixedClock::new(Utc.with_ymd_and_hms(2026, 8, 1, 9, 0, 0).unwrap()),
     )
     .unwrap();
+    zbrain::signing::KeyStore::init(&paths, Utc.with_ymd_and_hms(2026, 8, 1, 9, 0, 0).unwrap())
+        .unwrap();
     Fixture { dir, paths }
 }
 
@@ -100,6 +103,8 @@ fn claim_path(fx: &Fixture, id: &str) -> PathBuf {
 /// recorded digest covers the approved text.
 fn write_claim(fx: &Fixture, claim: &mut Claim) {
     claim.verified_digest = claim_verification_digest(claim).unwrap();
+    let keys = zbrain::signing::KeyStore::open(&fx.paths).unwrap();
+    zbrain::signing::sign_claim(claim, &keys).unwrap();
     let rendered = render_claim_markdown(claim).unwrap();
     let dir = fx.paths.workspaces_dir.join("research/wiki/projects");
     std::fs::create_dir_all(&dir).unwrap();

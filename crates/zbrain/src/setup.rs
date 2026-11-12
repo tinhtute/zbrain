@@ -59,12 +59,13 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        let paths = Paths::resolve(crate::paths::Options {
+        let mut paths = Paths::resolve(crate::paths::Options {
             cwd: Some(root.clone()),
             home_dir: Some(root.clone()),
             runtime_dir: Some(root.join(".zbrain")),
         })
         .unwrap();
+        paths.key_dir = crate::signing::test_key_dir();
         (root, paths)
     }
 

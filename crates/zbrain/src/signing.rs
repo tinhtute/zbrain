@@ -130,77 +130,13 @@ impl KeyStore {
     /// Load and validate the anchor. Fails closed on a symlinked key directory
     /// or file, a directory inside the runtime root, or a looser mode.
     pub fn open(paths: &Paths) -> Result<Self, KeyError> {
-        let dir = paths.key_dir.clone();
-        check_placement(&dir, &paths.runtime_dir)?;
-        check_directory(&dir)?;
-        let state = read_checked_file(&dir.join(KEY_STATE_FILE))?;
-        let keys = parse_key_state(&state)?;
-        let public = read_checked_file(&dir.join(PUBLIC_KEY_FILE))?;
-        let public_key = decode_public_key(&public)?;
-        // A key set with no active key (all retired or revoked) still verifies
-        // older claims; only signing needs an active key.
-        if let Some(active) = keys.iter().find(|key| key.state == "active") {
-            if active.public_key != public_key {
-                return Err(KeyError::new(format!(
-                    "{} does not match the active key {} in {}",
-                    dir.join(PUBLIC_KEY_FILE).display(),
-                    active.key_id,
-                    dir.join(KEY_STATE_FILE).display()
-                )));
-            }
-        }
-        let private = dir.join(PRIVATE_KEY_FILE);
-        if private.exists() {
-            check_file(&private)?;
-        }
-        Ok(Self { dir, keys })
+        open_key_dir(&paths.key_dir, &paths.runtime_dir)
     }
 
     /// Create the owner key, or converge a half-written one. Refuses when a
     /// private key already exists: rotation is a separate ceremony.
     pub fn init(paths: &Paths, now: DateTime<Utc>) -> Result<KeyInit, KeyError> {
-        let dir = paths.key_dir.clone();
-        check_placement(&dir, &paths.runtime_dir)?;
-        if dir.exists() {
-            check_directory(&dir)?;
-        } else {
-            create_key_directory(&dir)?;
-        }
-        let private_path = dir.join(PRIVATE_KEY_FILE);
-        if private_path.exists() {
-            return Err(KeyError::new(format!(
-                "approval key already exists at {}; rotation is a separate ceremony",
-                private_path.display()
-            )));
-        }
-        let signing_key = SigningKey::generate(&mut rand_core::OsRng);
-        let public_key = signing_key.verifying_key();
-        let key_id = key_id_for(&public_key);
-        let created_at = crate::clock::rfc3339(now);
-        let public_path = write_key_file(
-            &dir,
-            PUBLIC_KEY_FILE,
-            format!("{}\n", BASE64.encode(public_key.to_bytes())).as_bytes(),
-        )?;
-        let keys_file = write_key_file(
-            &dir,
-            KEY_STATE_FILE,
-            &key_state_yaml(&key_id, &public_key, &created_at),
-        )?;
-        // The private key lands last: a crash before this rename leaves no
-        // private key, so the next `init` regenerates and converges.
-        let private_key = write_key_file(
-            &dir,
-            PRIVATE_KEY_FILE,
-            format!("{}\n", BASE64.encode(signing_key.to_bytes())).as_bytes(),
-        )?;
-        Ok(KeyInit {
-            key_id,
-            dir,
-            private_key,
-            public_key: public_path,
-            keys_file,
-        })
+        init_key_dir(&paths.key_dir, &paths.runtime_dir, now)
     }
 
     pub fn dir(&self) -> &Path {
@@ -228,6 +164,78 @@ impl KeyStore {
         }
         Ok((active.key_id.clone(), signing_key))
     }
+}
+
+fn open_key_dir(dir: &Path, runtime_dir: &Path) -> Result<KeyStore, KeyError> {
+    let dir = dir.to_path_buf();
+    check_placement(&dir, runtime_dir)?;
+    check_directory(&dir)?;
+    let state = read_checked_file(&dir.join(KEY_STATE_FILE))?;
+    let keys = parse_key_state(&state)?;
+    let public = read_checked_file(&dir.join(PUBLIC_KEY_FILE))?;
+    let public_key = decode_public_key(&public)?;
+    // A key set with no active key (all retired or revoked) still verifies
+    // older claims; only signing needs an active key.
+    if let Some(active) = keys.iter().find(|key| key.state == "active") {
+        if active.public_key != public_key {
+            return Err(KeyError::new(format!(
+                "{} does not match the active key {} in {}",
+                dir.join(PUBLIC_KEY_FILE).display(),
+                active.key_id,
+                dir.join(KEY_STATE_FILE).display()
+            )));
+        }
+    }
+    let private = dir.join(PRIVATE_KEY_FILE);
+    if private.exists() {
+        check_file(&private)?;
+    }
+    Ok(KeyStore { dir, keys })
+}
+
+fn init_key_dir(dir: &Path, runtime_dir: &Path, now: DateTime<Utc>) -> Result<KeyInit, KeyError> {
+    let dir = dir.to_path_buf();
+    check_placement(&dir, runtime_dir)?;
+    if dir.exists() {
+        check_directory(&dir)?;
+    } else {
+        create_key_directory(&dir)?;
+    }
+    let private_path = dir.join(PRIVATE_KEY_FILE);
+    if private_path.exists() {
+        return Err(KeyError::new(format!(
+            "approval key already exists at {}; rotation is a separate ceremony",
+            private_path.display()
+        )));
+    }
+    let signing_key = SigningKey::generate(&mut rand_core::OsRng);
+    let public_key = signing_key.verifying_key();
+    let key_id = key_id_for(&public_key);
+    let created_at = crate::clock::rfc3339(now);
+    let public_path = write_key_file(
+        &dir,
+        PUBLIC_KEY_FILE,
+        format!("{}\n", BASE64.encode(public_key.to_bytes())).as_bytes(),
+    )?;
+    let keys_file = write_key_file(
+        &dir,
+        KEY_STATE_FILE,
+        &key_state_yaml(&key_id, &public_key, &created_at),
+    )?;
+    // The private key lands last: a crash before this rename leaves no
+    // private key, so the next `init` regenerates and converges.
+    let private_key = write_key_file(
+        &dir,
+        PRIVATE_KEY_FILE,
+        format!("{}\n", BASE64.encode(signing_key.to_bytes())).as_bytes(),
+    )?;
+    Ok(KeyInit {
+        key_id,
+        dir,
+        private_key,
+        public_key: public_path,
+        keys_file,
+    })
 }
 
 /// Sign the claim's current verified block with the active owner key.
@@ -580,6 +588,42 @@ fn write_key_file(dir: &Path, name: &str, contents: &[u8]) -> Result<PathBuf, Ke
         ))
     })?;
     Ok(final_path)
+}
+
+/// Process-wide throwaway key for unit tests. Fixtures point `Paths.key_dir`
+/// at it; it never touches the real `~/.config`.
+#[cfg(test)]
+pub(crate) fn test_key_dir() -> PathBuf {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("zbrain-test-keys-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        init_key_dir(&dir, &dir.join("runtime"), Utc::now()).expect("init test approval key");
+        dir
+    })
+    .clone()
+}
+
+#[cfg(test)]
+pub(crate) fn test_key_store() -> KeyStore {
+    static STORE: std::sync::OnceLock<KeyStore> = std::sync::OnceLock::new();
+    STORE
+        .get_or_init(|| {
+            let dir = test_key_dir();
+            open_key_dir(&dir, &dir.join("runtime")).expect("open test approval key")
+        })
+        .clone()
+}
+
+/// Sign an approved claim built by a test with the process-wide test key.
+#[cfg(test)]
+pub(crate) fn sign_test_claim(claim: &mut Claim) {
+    let store = test_key_store();
+    if claim.verified_digest.is_empty() {
+        claim.verified_digest = crate::claims::claim_verification_digest(claim)
+            .expect("test claim verification digest");
+    }
+    sign_claim(claim, &store).expect("sign test claim");
 }
 
 #[cfg(test)]
