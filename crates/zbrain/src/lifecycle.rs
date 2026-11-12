@@ -147,6 +147,14 @@ impl ClaimStore {
         });
         let digest = claim_verification_digest(&claim)?;
         claim.verified_digest = digest;
+        // The owner ceremony is the only place an approved claim is born:
+        // sign the verified block here so every approval path (claim approve,
+        // claim_lifecycle apply, supersede) carries a signature. A missing or
+        // invalid key fails before the challenge token is consumed.
+        let keys = crate::signing::KeyStore::open(&self.paths)
+            .map_err(|err| message(format!("approval signing key unavailable: {err}")))?;
+        crate::signing::sign_claim(&mut claim, &keys)
+            .map_err(|err| message(format!("sign approved claim: {err}")))?;
 
         for old in &mut old_claims {
             old.status = CLAIM_STATUS_SUPERSEDED.to_string();

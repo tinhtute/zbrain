@@ -746,6 +746,13 @@ impl App {
         // before reading the claim, so a script learns nothing and mutates
         // nothing.
         let mut prompt = self.make_prompt()?;
+        // Fail before a challenge is prepared when the owner key is missing or
+        // invalid: nothing is mutated and no token is issued.
+        crate::signing::KeyStore::open(&self.paths).map_err(|err| {
+            CliError::failure(format!(
+                "approval signing key unavailable: {err}; run `zbrain key init`"
+            ))
+        })?;
         let store = ClaimStore::with_clock(self.paths.clone(), self.clock.clone());
         let prepare = store
             .approve_challenge_prepare(&workspace, &parsed.rest[0])
