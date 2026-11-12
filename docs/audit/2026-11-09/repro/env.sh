@@ -9,3 +9,9 @@ jid() { python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])'; }
 # answers the confirmation prompt. Nothing is bypassed, and stderr is dropped so
 # repro output stays comparable to the pre-gate baseline.
 approve() { python3 "$ROOT/scripts/owner-approve.py" --bin "$Z" "$@" 2>/dev/null; }
+# Portable helpers (macOS + Linux): BSD sed -i needs a suffix arg and macOS has no `timeout`.
+subst() { perl -pi -e "$1" "$2"; }   # usage: subst 's/a/b/' file
+if ! command -v timeout >/dev/null 2>&1; then
+  if command -v gtimeout >/dev/null 2>&1; then timeout() { gtimeout "$@"; }
+  else timeout() { local s=$1; shift; perl -e 'alarm shift; exec @ARGV or die "$!"' "$s" "$@"; }; fi
+fi
