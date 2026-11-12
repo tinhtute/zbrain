@@ -3843,10 +3843,16 @@ mod tests {
         assert_eq!(status_value["embedding"]["indexed"], 1);
         assert_eq!(status_value["embedding"]["eligible"], 1);
 
+        // Hybrid retrieval widens recall to partial token overlap: the query
+        // shares "resource" with the fixture claim but not every token, so the
+        // lexical AND misses and the vector side finds it. A query sharing no
+        // token at all must gap (see tests/embed_readiness.rs).
         let hybrid = reg
             .call_tool(
                 "memory_ask",
-                Some(&args(r#"{"query":"embedding-only-term","embedding":true}"#)),
+                Some(&args(
+                    r#"{"query":"resource embedding-only-term","embedding":true}"#,
+                )),
             )
             .unwrap();
         let hybrid_value: Value = serde_json::from_str(&hybrid.content[0].text).unwrap();

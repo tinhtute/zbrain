@@ -16,7 +16,7 @@ use crate::coordination::{
     acquire_workspace_lock, run_workspace_generation_test_hook,
     WORKSPACE_GENERATION_HOOK_TRUSTED_QUERY_AFTER_LOCKING,
 };
-use crate::embedder::EmbeddingStore;
+use crate::embedder::{embedding_text, shares_meaningful_token, EmbeddingStore};
 use crate::evidence::{validate_claim_evidence, EvidenceValidator};
 use crate::index::{IndexError, IndexStore, IndexedClaim, SearchOptions};
 use crate::manifest::TrustInputManifest;
@@ -406,8 +406,14 @@ fn query_contradictions(contradictions: &[Contradiction]) -> Vec<QueryContradict
 
 /// mergeVectorResults performs hybrid retrieval: it searches the embedding
 /// sidecar for vector matches and merges them with the lexical results. The
-/// original approved slice is returned unchanged when the sidecar is missing
-/// or has no vectors.
+/// original approved slice is returned unchanged when the sidecar is missing,
+/// has no vectors, or holds no vector that shares a meaningful token with the
+/// query.
+///
+/// A vector only counts as evidence when it shares a significant token with the
+/// query. loopback-v1 scores unrelated text above zero by hash collision and
+/// stopword overlap, so ranking alone would let a miss answer "ready"; the
+/// token gate is what keeps readiness fail-closed.
 fn merge_vector_results(
     paths: &Paths,
     idx: &IndexStore,
@@ -437,7 +443,21 @@ fn merge_vector_results(
     let ordered: Vec<IndexedClaim> = vec_ids
         .iter()
         .filter_map(|id| by_id.get(id).cloned())
+        .filter(|claim| {
+            shares_meaningful_token(
+                query,
+                &embedding_text(
+                    &claim.title,
+                    &claim.description,
+                    &claim.indexed_tags,
+                    &claim.indexed_body,
+                ),
+            )
+        })
         .collect();
+    if ordered.is_empty() {
+        return Ok(approved);
+    }
     Ok(interleave_claims(approved, ordered, limit))
 }
 

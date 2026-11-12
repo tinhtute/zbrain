@@ -25,6 +25,13 @@
   legacy files render byte-identically.
 
 ### Fixed
+- `ask --embed` no longer answers `ready` from a vector that has nothing to do
+  with the query. Vector results now count as evidence only when they share a
+  meaningful token (a non-stopword of three or more characters) with the query;
+  otherwise the answer falls back to the lexical result, which reports `gap`.
+  `--embed` therefore widens recall to partial token overlap, not to unrelated
+  claims: the loopback embedder is a hashed bag-of-words and has no paraphrase
+  recall. The same rule covers MCP `memory_ask`.
 - The viewer, MCP claim resource, `status`, and `memory_status` read claims
   through one verified path: an approved claim whose canonical file was
   tampered after approval is dropped or reported as invalid, never served as
