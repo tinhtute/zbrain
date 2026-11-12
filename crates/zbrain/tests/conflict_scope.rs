@@ -11,8 +11,7 @@ use chrono::{DateTime, TimeZone, Utc};
 
 use zbrain::assets::extract_bundled_assets;
 use zbrain::claims::{
-    render_claim_markdown, Claim, ClaimStore, CLAIM_BASIS_OWNER, CLAIM_STATUS_DRAFT,
-    OKF_CLAIM_TYPE,
+    render_claim_markdown, Claim, ClaimStore, CLAIM_BASIS_OWNER, CLAIM_STATUS_DRAFT, OKF_CLAIM_TYPE,
 };
 use zbrain::clock::FixedClock;
 use zbrain::config::ensure_config;
@@ -79,7 +78,9 @@ fn store_at(paths: &Paths, at: DateTime<Utc>) -> ClaimStore {
 }
 
 fn write_approved(paths: &Paths, at: DateTime<Utc>, claim: &Claim) {
-    store_at(paths, at).write_draft("research", claim.clone()).unwrap();
+    store_at(paths, at)
+        .write_draft("research", claim.clone())
+        .unwrap();
     store_at(paths, at).approve("research", &claim.id).unwrap();
 }
 
@@ -375,11 +376,7 @@ fn unsigned_historical_conflict_target_does_not_block() {
     target.verified_alg.clear();
     target.verified_key_id.clear();
     target.verified_sig.clear();
-    write_claim_file(
-        &paths,
-        TARGET,
-        &render_claim_markdown(&target).unwrap(),
-    );
+    write_claim_file(&paths, TARGET, &render_claim_markdown(&target).unwrap());
     rebuild(&paths);
 
     let unsigned = ask(&paths, "friday", 10, "2026-08-15T00:00:00Z");

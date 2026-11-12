@@ -680,19 +680,43 @@ impl IndexStore {
         workspace: &str,
         ids: &[String],
     ) -> Result<Vec<IndexedClaim>, IndexError> {
-        if ids.is_empty() {
+        let statuses = [CLAIM_STATUS_APPROVED.to_string()];
+        self.claims_by_ids_with_statuses_unlocked(workspace, ids, &statuses)
+    }
+
+    /// claimsByIDsWithStatusesUnlocked returns indexed claims matching the
+    /// given IDs and statuses. IDs that are not present in the index are
+    /// ignored. The caller must already hold the workspace lock and have
+    /// validated freshness.
+    pub(crate) fn claims_by_ids_with_statuses_unlocked(
+        &self,
+        workspace: &str,
+        ids: &[String],
+        statuses: &[String],
+    ) -> Result<Vec<IndexedClaim>, IndexError> {
+        if ids.is_empty() || statuses.is_empty() {
             return Ok(Vec::new());
+        }
+        for status in statuses {
+            if !is_known_claim_status(status) {
+                return msg(format!("claim status {status:?} is not supported"));
+            }
         }
         let database_path = self.database_path(workspace)?;
         let conn = open_index(&database_path)?;
-        let placeholders = vec!["?"; ids.len()].join(",");
+        let id_placeholders = vec!["?"; ids.len()].join(",");
+        let status_placeholders = vec!["?"; statuses.len()].join(",");
         let sql = format!(
             "select id, path, tier, type, status, title, description, stale_after, tags, body, verification_digest
 from claims
-where status = ? and id in ({placeholders})"
+where status in ({status_placeholders}) and id in ({id_placeholders})"
         );
         let mut statement = conn.prepare(&sql)?;
-        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(CLAIM_STATUS_APPROVED)];
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> =
+            Vec::with_capacity(statuses.len() + ids.len());
+        for status in statuses {
+            params.push(Box::new(status.clone()));
+        }
         for id in ids {
             params.push(Box::new(id.clone()));
         }

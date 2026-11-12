@@ -2,7 +2,7 @@
 //! (ask), canonical index binding, contradiction surfacing, temporal recall,
 //! and hybrid (RRF) retrieval over the loopback embedding sidecar.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -229,25 +229,25 @@ pub fn trusted_query(
             fresh: true,
         });
     }
+    let trusted_statuses: Vec<String> = if temporal.as_of.is_some() {
+        vec![
+            crate::claims::CLAIM_STATUS_APPROVED.into(),
+            crate::claims::CLAIM_STATUS_SUPERSEDED.into(),
+            crate::claims::CLAIM_STATUS_REVOKED.into(),
+        ]
+    } else {
+        vec![crate::claims::CLAIM_STATUS_APPROVED.into()]
+    };
     for workspace in &workspaces {
         let manifest = manifests
             .get(workspace)
             .cloned()
             .expect("manifest captured for workspace");
-        let trusted_statuses: Vec<String> = if temporal.as_of.is_some() {
-            vec![
-                crate::claims::CLAIM_STATUS_APPROVED.into(),
-                crate::claims::CLAIM_STATUS_SUPERSEDED.into(),
-                crate::claims::CLAIM_STATUS_REVOKED.into(),
-            ]
-        } else {
-            vec![crate::claims::CLAIM_STATUS_APPROVED.into()]
-        };
         let approved = idx.search_unlocked_internal(
             workspace,
             SearchOptions {
                 query: options.query.clone(),
-                statuses: trusted_statuses,
+                statuses: trusted_statuses.clone(),
                 limit,
             },
             false,
@@ -259,17 +259,10 @@ pub fn trusted_query(
                 merge_vector_results(paths, &idx, workspace, approved, &options.query, limit)?;
         }
         for claim in approved {
-            validate_indexed_claim_binding_internal(
-                paths,
-                workspace,
-                &claim,
-                Some(&manifest),
-                false,
-            )?;
-            let canonical = ClaimStore::new(paths.clone()).read(workspace, &claim.id)?;
-            if !match_temporal_claim(&canonical, &temporal) {
+            let Some(canonical) = trusted_claim_at(paths, workspace, &manifest, &claim, &temporal)?
+            else {
                 continue;
-            }
+            };
             let mut query_claim = to_query_claim(workspace, &claim);
             query_claim.sources = if canonical.sources.is_empty() {
                 None
@@ -281,15 +274,11 @@ pub fn trusted_query(
             } else {
                 Some(query_contradictions(&canonical.contradicts))
             };
-            if let Some(as_of) = temporal.as_of {
-                if canonical.status == crate::claims::CLAIM_STATUS_SUPERSEDED
-                    || canonical.status == crate::claims::CLAIM_STATUS_REVOKED
-                {
-                    if verify_historical_claim(paths, workspace, &canonical, as_of).is_err() {
-                        continue;
-                    }
-                    query_claim.status = crate::claims::CLAIM_STATUS_APPROVED.into();
-                }
+            if temporal.as_of.is_some()
+                && (canonical.status == crate::claims::CLAIM_STATUS_SUPERSEDED
+                    || canonical.status == crate::claims::CLAIM_STATUS_REVOKED)
+            {
+                query_claim.status = crate::claims::CLAIM_STATUS_APPROVED.into();
             }
             response
                 .claims
@@ -344,7 +333,14 @@ pub fn trusted_query(
     if let Some(candidates) = response.promotion_candidates.as_mut() {
         sort_query_claims(candidates);
     }
-    let conflicts = find_query_conflicts(paths, response.claims.as_deref().unwrap_or(&[]))?;
+    let conflicts = find_query_conflicts(
+        paths,
+        &idx,
+        &manifests,
+        &trusted_statuses,
+        response.claims.as_deref().unwrap_or(&[]),
+        &temporal,
+    )?;
     let blocked = !conflicts.is_empty();
     response.conflicts = conflicts;
     if blocked {
@@ -914,11 +910,67 @@ pub(crate) fn sort_query_claims(claims: &mut [QueryClaim]) {
     });
 }
 
+/// Loads the canonical claim behind an indexed row and applies the trusted
+/// query's per-claim rule: the row must bind to the published manifest, the
+/// canonical claim must verify through the approved read path, and it must be
+/// trusted at the query instant. Returns `None` when the row is not trusted
+/// now. The returned page and the declared conflict targets share this rule,
+/// so an unverified or unsigned target can neither block nor unblock.
+fn trusted_claim_at(
+    paths: &Paths,
+    workspace: &str,
+    manifest: &TrustInputManifest,
+    indexed: &IndexedClaim,
+    temporal: &TemporalFilter,
+) -> Result<Option<Claim>, IndexError> {
+    validate_indexed_claim_binding_internal(paths, workspace, indexed, Some(manifest), false)?;
+    let canonical = ClaimStore::new(paths.clone()).read(workspace, &indexed.id)?;
+    if !match_temporal_claim(&canonical, temporal) {
+        return Ok(None);
+    }
+    if let Some(as_of) = temporal.as_of {
+        let terminal = canonical.status == crate::claims::CLAIM_STATUS_SUPERSEDED
+            || canonical.status == crate::claims::CLAIM_STATUS_REVOKED;
+        if terminal && verify_historical_claim(paths, workspace, &canonical, as_of).is_err() {
+            return Ok(None);
+        }
+    }
+    Ok(Some(canonical))
+}
+
+fn record_conflict(
+    conflicts: &mut Vec<QueryConflict>,
+    seen: &mut HashSet<String>,
+    workspace: &str,
+    left: &str,
+    right: &str,
+) {
+    let mut ids = vec![left.to_string(), right.to_string()];
+    ids.sort();
+    let key = format!("{workspace}:{}:{}", ids[0], ids[1]);
+    if !seen.insert(key) {
+        return;
+    }
+    conflicts.push(QueryConflict {
+        workspace: workspace.to_string(),
+        claim_ids: ids,
+    });
+}
+
+/// Collects the declared conflicts of every returned claim. A target inside
+/// the returned page is already trusted by the main loop; a target outside it
+/// is looked up by id in the same workspace and must pass the same trust rule
+/// before it blocks. Conflicts are declared one-way in the claim format, so
+/// only the returned claim's declarations are checked.
 fn find_query_conflicts(
     paths: &Paths,
+    idx: &IndexStore,
+    manifests: &HashMap<String, TrustInputManifest>,
+    trusted_statuses: &[String],
     claims: &[QueryClaim],
+    temporal: &TemporalFilter,
 ) -> Result<Vec<QueryConflict>, IndexError> {
-    let mut by_workspace: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+    let mut by_workspace: HashMap<String, HashSet<String>> = HashMap::new();
     for claim in claims {
         by_workspace
             .entry(claim.workspace.clone())
@@ -926,7 +978,9 @@ fn find_query_conflicts(
             .insert(claim.id.clone());
     }
     let mut conflicts: Vec<QueryConflict> = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut outside: HashMap<String, BTreeSet<String>> = HashMap::new();
+    let mut pairs: Vec<(String, String, String)> = Vec::new();
     for query_claim in claims {
         let claim = read_claim_by_path(paths, &query_claim.workspace, &query_claim.path)?;
         if claim.id != query_claim.id {
@@ -936,22 +990,51 @@ fn find_query_conflicts(
             )));
         }
         for other in &claim.conflicts_with {
-            let Some(scope) = by_workspace.get(&query_claim.workspace) else {
-                continue;
-            };
-            if !scope.contains(other) {
+            let in_page = by_workspace
+                .get(&query_claim.workspace)
+                .is_some_and(|scope| scope.contains(other));
+            if in_page {
+                record_conflict(
+                    &mut conflicts,
+                    &mut seen,
+                    &query_claim.workspace,
+                    &query_claim.id,
+                    other,
+                );
                 continue;
             }
-            let mut ids = vec![query_claim.id.clone(), other.clone()];
-            ids.sort();
-            let key = format!("{}:{}:{}", query_claim.workspace, ids[0], ids[1]);
-            if !seen.insert(key) {
-                continue;
+            outside
+                .entry(query_claim.workspace.clone())
+                .or_default()
+                .insert(other.clone());
+            pairs.push((
+                query_claim.workspace.clone(),
+                query_claim.id.clone(),
+                other.clone(),
+            ));
+        }
+    }
+    if outside.is_empty() {
+        return Ok(conflicts);
+    }
+    let mut trusted: HashSet<(String, String)> = HashSet::new();
+    for (workspace, ids) in outside {
+        let Some(manifest) = manifests.get(&workspace) else {
+            return Err(IndexError::Message(format!(
+                "workspace {workspace:?} has no published trust manifest"
+            )));
+        };
+        let ids: Vec<String> = ids.into_iter().collect();
+        let rows = idx.claims_by_ids_with_statuses_unlocked(&workspace, &ids, trusted_statuses)?;
+        for row in rows {
+            if trusted_claim_at(paths, &workspace, manifest, &row, temporal)?.is_some() {
+                trusted.insert((workspace.clone(), row.id));
             }
-            conflicts.push(QueryConflict {
-                workspace: query_claim.workspace.clone(),
-                claim_ids: ids,
-            });
+        }
+    }
+    for (workspace, declaring, target) in pairs {
+        if trusted.contains(&(workspace.clone(), target.clone())) {
+            record_conflict(&mut conflicts, &mut seen, &workspace, &declaring, &target);
         }
     }
     Ok(conflicts)
