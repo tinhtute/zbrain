@@ -13,7 +13,7 @@ serde_json = { version = "1", features = ["raw_value"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 libc = "0.2"
 yaml-rust2 = "0.10"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 include_dir = "0.7"
 sha2 = "0.10"
 console = "0.15"
