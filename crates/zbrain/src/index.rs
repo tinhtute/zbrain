@@ -1933,6 +1933,7 @@ mod tests {
             ..crate::claims::ClaimTransition::default()
         }];
         approved.verified_digest = crate::claims::claim_verification_digest(&approved).unwrap();
+        crate::signing::sign_test_claim(&mut approved);
         let target = crate::claims::render_claim_markdown(&approved).unwrap();
         transition::write_pending_transition(
             &paths,
@@ -2227,6 +2228,7 @@ mod tests {
         let mut approved = claim_store.approve("research", &claim.id).unwrap();
         approved.sources[0].digest = format!("sha256:{}", evidence.sha256);
         approved.verified_digest = crate::claims::claim_verification_digest(&approved).unwrap();
+        crate::signing::sign_test_claim(&mut approved);
         let claim_path = paths
             .workspaces_dir
             .join("research/wiki/projects")
@@ -2264,6 +2266,7 @@ mod tests {
         let mut approved = claim_store.approve("research", &claim.id).unwrap();
         approved.evidence_ids = vec![evidence.id.clone(), evidence.id.clone()];
         approved.verified_digest = crate::claims::claim_verification_digest(&approved).unwrap();
+        crate::signing::sign_test_claim(&mut approved);
         let claim_path = paths
             .workspaces_dir
             .join("research/wiki/projects")

@@ -1784,6 +1784,17 @@ impl ClaimStore {
         let mut trust_validator = TrustValidator::from_store(self, workspace)?;
         let mut evidence_validator = EvidenceValidator::new(self.paths.clone(), workspace)
             .map_err(|err| message(err.to_string()))?;
+        // Load the owner anchor once per call; a missing or invalid key set
+        // makes every approved claim untrusted (fail closed), and the error
+        // names the fix.
+        let anchor = if claims
+            .iter()
+            .any(|claim| claim.status == CLAIM_STATUS_APPROVED)
+        {
+            Some(crate::signing::KeyStore::open(&self.paths))
+        } else {
+            None
+        };
         let mut valid_claims = Vec::with_capacity(claims.len());
         let mut invalid_claims: Vec<InvalidClaim> = Vec::new();
         for claim in claims {
@@ -1791,7 +1802,14 @@ impl ClaimStore {
                 valid_claims.push(claim.clone());
                 continue;
             }
+            let signature = match &anchor {
+                Some(Ok(store)) => crate::signing::verify_claim_signature(claim, store),
+                Some(Err(err)) => Err(err.clone()),
+                None => Ok(()),
+            }
+            .map_err(|err| message(format!("approval signature: {err}")));
             let result = verify_claim_digest(claim)
+                .and_then(|()| signature)
                 .and_then(|()| validate_claim_evidence(&mut evidence_validator, claim))
                 .and_then(|()| {
                     trust_validator
@@ -1838,6 +1856,26 @@ impl ClaimStore {
                     .unwrap_or("unknown reason")
             ))),
         }
+    }
+
+    /// Approved claims whose signature does not verify against the anchor.
+    /// `doctor` uses this to name the batch re-sign command; a missing anchor
+    /// is reported separately, so this returns only signature failures.
+    pub fn unsigned_approved_claims(&self, workspace: &str) -> Result<Vec<String>, ClaimError> {
+        let store = match crate::signing::KeyStore::open(&self.paths) {
+            Ok(store) => store,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let scan = self.scan_workspace_inner(workspace, false)?;
+        let mut ids: Vec<String> = scan
+            .claims
+            .iter()
+            .filter(|claim| claim.status == CLAIM_STATUS_APPROVED)
+            .filter(|claim| crate::signing::verify_claim_signature(claim, &store).is_err())
+            .map(|claim| claim.id.clone())
+            .collect();
+        ids.sort();
+        Ok(ids)
     }
 
     pub(crate) fn scan_workspace_inner(
