@@ -1,0 +1,78 @@
+===== 01_forge_approved.sh
+  "approved": 1,
+  "invalid": 0,
+  "rebuild_state": "clean",
+  "status": "ready",
+      "id": "clm_00000000000000000000000000000bad",
+      "status": "approved",
+===== 02_scripted_approve.sh
+  "status": "approved",
+===== 03_conflict_outside_results.sh
+q=deploy window:
+  "status": "blocked",
+q=friday:
+  "status": "ready",
+      "status": "approved",
+===== 04_asof_forged_revoked.sh
+  "invalid": 0,
+  "rebuild_state": "clean",
+  "status": "ready",
+      "id": "clm_000000000000000000000000000000aa",
+      "status": "approved",
+===== 05_derived_state.sh
+{"current":2,"published":2}
+
+-- drop indexes/ only
+workspace "ws" index does not exist; run zbrain reindex
+  "status": "ready",
+-- drop workspace .zbrain/ (generation + lock)
+workspace "ws" generation state is malformed or missing: No such file or directory (os error 2); run zbrain reindex
+  "status": "ready",
+-- drop both
+  "status": "ready",
+===== 06_evidence_tamper.sh
+total 8
+-r-------- 1 tinhpt tinhpt  20 Nov  9 10:22 raw
+-r-------- 1 tinhpt tinhpt 225 Nov  9 10:22 source.yaml
+id: evd_96525893c006804af332671070ebeb3c
+origin: https://example.invalid/sla
+captured_at: "2026-11-09T03:22:24Z"
+media_type: text/plain
+byte_length: 20
+sha256: b379ce52206aefe65d6d0975a9dc13265cd5a74562d0aeb9eb7b54402ab3e868
+-- ask after raw edit
+workspace "ws" index is stale; trust input "$S/homes/evid/workspaces/ws/evidence/sources/evd_96525893c006804af332671070ebeb3c/raw" changed after index; run zbrain reindex
+-- reindex
+      "error": "evidence evd_96525893c006804af332671070ebeb3c: evidence verification failed for evd_96525893c006804af332671070ebeb3c at evidence/sources/evd_96525893c006804af332671070ebeb3c/raw: byte length = 18, want 20"
+  "rebuild_state": "rejected",
+===== 07_view_host.sh
+[{"Schema":"","Type":"zbrain.claim","ID":"clm_aaa95038c37dc419579d12f719b3e295","Tier":"projects","Path":"projects/clm_aaa95038c37dc419579d12f719b3e295.md","Status":"approved","Title":"M\u0026A","Description":"","Resource":"","Basis":"owner","CreatedAt":"2026-11-09T03:22:24Z","CreatedBy":"owner","VerifiedAt":"2026-11-09T03:22:24Z","VerifiedBy":"owner","VerifiedDigest":"sha256:8993ee6276fbb9dd7ca78
+===== 08_view_skips_digest.sh
+      "error": "verification digest mismatch"
+  "rebuild_state": "rejected",
+workspace "ws" index is rejected: 1 invalid trust inputs; run zbrain reindex
+approved | the deploy window is friday (tampered)
+===== 09_mcp_resource_skips_digest.sh
+{'Status': 'approved', 'Body': 'the deploy window is friday (tampered)\n'}
+===== 10_stale_after_ignored.sh
+plain ask:
+  "status": "ready",
+ask --as-of now:
+  "status": "gap",
+doctor:
+    "claim clm_a5fbd2452c21673cfb55262905dba06a stale_after 2020-01-01T00:00:00Z is in the past"
+===== 11_symlink_claim.sh
+trust input "$S/homes/symlink/workspaces/ws/wiki/projects/clm_598ecabc04b9c1af2507268c8ba2e1a5.md" must not be a symlink
+workspace "ws" index is dirty; run zbrain reindex
+===== 12_plain_md_bricks.sh
+ask before reindex:
+  "status": "ready",
+reindex:
+  "legacy": 1,
+  "rebuild_state": "rejected",
+ask after reindex:
+workspace "ws" index is rejected: 1 invalid trust inputs; run zbrain reindex
+===== 13_embed_never_gaps.sh
+"embedding":{"strategy":"loopback","model":"zbrain/loopback-v1","indexed":1,
+lexical:   "status": "gap",
+--embed:   "status": "ready",  ->       "title": "Deploy window",
