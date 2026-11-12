@@ -8,9 +8,12 @@ terminal, so this driver allocates one (a pty), attaches it to the child's
 stdin and stdout, answers the prompt with the digest suffix, and forwards the
 child's output and exit code.
 
-Nothing is bypassed. A binary that refuses without a TTY still refuses; a
-binary that does not prompt at all (an older build) is passed through
-unchanged, so the same driver works before and after the ceremony gate.
+The TTY check is owner-presence friction, not a security boundary: any pty
+passes it, including this one. The driver exists so CI, `make smoke`, and the
+audit repros can run the real ceremony; it is not owner proof. Owner proof is
+the planned signed-approval work. A binary that does not prompt at all (an
+older build) is passed through unchanged, so the same driver works before and
+after the ceremony gate.
 
 Usage:
     scripts/owner-approve.py [--bin PATH] <claim-id> [--workspace <name>]

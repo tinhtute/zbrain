@@ -7,11 +7,28 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-fn temp_home(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("zbrain-approve-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+/// Named temp home, removed on drop: the guard owns the directory for the
+/// test body and leaves nothing behind when the test ends.
+struct TempHome(PathBuf);
+
+impl TempHome {
+    fn new(name: &str) -> Self {
+        let dir =
+            std::env::temp_dir().join(format!("zbrain-approve-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Self(dir)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempHome {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 fn zbrain(home: &Path, args: &[&str], stdin: Option<&str>) -> Output {
@@ -40,14 +57,15 @@ fn zbrain(home: &Path, args: &[&str], stdin: Option<&str>) -> Output {
 
 #[test]
 fn claim_approve_refuses_without_tty() {
-    let home = temp_home("no-tty");
-    assert!(zbrain(&home, &["setup"], None).status.success());
-    assert!(zbrain(&home, &["workspace", "create", "ws"], None)
+    let home = TempHome::new("no-tty");
+    let home_path = home.path();
+    assert!(zbrain(home_path, &["setup"], None).status.success());
+    assert!(zbrain(home_path, &["workspace", "create", "ws"], None)
         .status
         .success());
 
     let draft = zbrain(
-        &home,
+        home_path,
         &[
             "claim",
             "draft",
@@ -63,11 +81,11 @@ fn claim_approve_refuses_without_tty() {
     assert!(draft.status.success());
     let draft: serde_json::Value = serde_json::from_slice(&draft.stdout).unwrap();
     let id = draft["id"].as_str().unwrap().to_string();
-    let claim_path = home
+    let claim_path = home_path
         .join("workspaces/ws/wiki")
         .join(draft["path"].as_str().unwrap());
 
-    let approve = zbrain(&home, &["claim", "approve", &id], None);
+    let approve = zbrain(home_path, &["claim", "approve", &id], None);
     let stderr = String::from_utf8_lossy(&approve.stderr);
     assert!(
         !approve.status.success(),

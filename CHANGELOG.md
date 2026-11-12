@@ -3,12 +3,13 @@
 ## Unreleased
 
 ### Fixed
-- `claim approve` runs the owner ceremony: a piped or agent-shell caller is
-  refused, and approval requires confirming the last 16 hex characters of the
-  action digest on an interactive TTY — the same challenge/grant path as
-  `approval grant`. Scripted approve steps (`make smoke`, the audit repros)
-  drive the real ceremony through `scripts/owner-approve.py` instead of
-  bypassing it.
+- `claim approve` runs the owner ceremony: a piped caller is refused, and
+  approval requires confirming the last 16 hex characters of the action digest
+  on an interactive TTY — the same challenge/grant path as `approval grant`.
+  The TTY check is owner-presence friction, not a security boundary: any pty
+  passes it, and owner proof is the planned signed-approval work. `make smoke`
+  and the audit repros drive the real ceremony through
+  `scripts/owner-approve.py`.
 
 ## 0.4.0 (2026-09-06) — Rust cutover
 
