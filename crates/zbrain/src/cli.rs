@@ -168,7 +168,7 @@ impl App {
             workspace: workspace.clone(),
             ..IndexSummary::default()
         };
-        match ClaimStore::new(self.paths.clone()).scan_workspace_for_trust(&workspace) {
+        match ClaimStore::new(self.paths.clone()).scan_workspace_trusted(&workspace) {
             Ok(scan) => {
                 summary.approved = scan.claims.len() as i64;
                 summary.invalid = scan.invalid.len() as i64;

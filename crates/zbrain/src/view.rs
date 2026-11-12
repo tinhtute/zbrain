@@ -386,7 +386,7 @@ struct EvidenceView {
 fn collect_views(paths: &Paths) -> Result<(String, Vec<ClaimView>), String> {
     let current = resolve_current_workspace(paths).map_err(|err| err.to_string())?;
     let scan = ClaimStore::new(paths.clone())
-        .scan_workspace_for_trust(&current.workspace)
+        .scan_workspace_trusted(&current.workspace)
         .map_err(|err| err.to_string())?;
     let evidence_store = EvidenceStore::new(paths.clone());
     let mut views = Vec::new();
@@ -478,7 +478,7 @@ pub fn render_page(paths: &Paths) -> Result<Vec<u8>, String> {
 fn approved_claims_json(paths: &Paths) -> Result<Vec<u8>, String> {
     let current = resolve_current_workspace(paths).map_err(|err| err.to_string())?;
     let scan = ClaimStore::new(paths.clone())
-        .scan_workspace_for_trust(&current.workspace)
+        .scan_workspace_trusted(&current.workspace)
         .map_err(|err| err.to_string())?;
     let mut out = String::from("[");
     let mut first = true;
@@ -500,7 +500,7 @@ fn claim_json(paths: &Paths, id: &str) -> Result<Vec<u8>, ClaimApiError> {
     let current =
         resolve_current_workspace(paths).map_err(|err| ClaimApiError::Server(err.to_string()))?;
     let claim = ClaimStore::new(paths.clone())
-        .read(&current.workspace, id)
+        .read_trusted(&current.workspace, id)
         .map_err(|_| ClaimApiError::NotFound)?;
     Ok(format!("{}\n", claim_go_json(&claim)).into_bytes())
 }
