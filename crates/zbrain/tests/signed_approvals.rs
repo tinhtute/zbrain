@@ -472,3 +472,50 @@ fn key_recover_requires_typing_the_new_key_id() {
     assert_eq!(status["approved"], 1, "{status}");
     assert_eq!(status["invalid"], 0, "{status}");
 }
+
+#[test]
+fn resign_signs_only_the_confirmed_list() {
+    use zbrain::claims::ClaimStore;
+    use zbrain::lifecycle::ResignTarget;
+
+    let fx = fixture("resign-bound");
+    let confirmed = "clm_0000000000000000000000000000000d";
+    let added = "clm_0000000000000000000000000000000e";
+    let changed = "clm_0000000000000000000000000000000f";
+    write_forged_claim(&fx, confirmed, "Confirmed", "confirmed body\n");
+    write_forged_claim(&fx, changed, "Changed", "changed body\n");
+
+    let mut cli = Cli::new(fx.paths.clone());
+    cli.run_ok(&["key", "init"]);
+    let store = ClaimStore::with_clock(fx.paths.clone(), cli.app.clock.clone());
+    let listed: Vec<ResignTarget> = store
+        .resign_candidates("research")
+        .unwrap()
+        .into_iter()
+        .map(|candidate| ResignTarget {
+            id: candidate.id.clone(),
+            digest: candidate.digest.clone(),
+        })
+        .collect();
+    assert_eq!(listed.len(), 2);
+
+    // While the prompt waits: a new approved claim appears, and one listed
+    // claim is rewritten with a recomputed digest (what a forger can do).
+    write_forged_claim(&fx, added, "Added", "added body\n");
+    write_forged_claim(&fx, changed, "Changed", "changed body, rewritten\n");
+
+    let report = store.resign_approved("research", &listed, &[]).unwrap();
+    assert_eq!(report.signed, vec![confirmed.to_string()], "{report:?}");
+    let skipped: Vec<&str> = report.skipped.iter().map(|skip| skip.id.as_str()).collect();
+    assert_eq!(skipped, vec![added, changed], "{report:?}");
+
+    let signed = std::fs::read_to_string(claim_path(&fx, confirmed)).unwrap();
+    assert!(signed.contains("sig: "), "{signed}");
+    for id in [added, changed] {
+        let contents = std::fs::read_to_string(claim_path(&fx, id)).unwrap();
+        assert!(
+            !contents.contains("sig:"),
+            "{id} was signed unseen: {contents}"
+        );
+    }
+}

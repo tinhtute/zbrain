@@ -38,6 +38,15 @@ pub struct ResignCandidate {
     pub digest: String,
 }
 
+/// One (id, digest) pair the owner confirmed in the re-sign ceremony. The
+/// ceremony signs only these exact pairs: a claim written or changed while
+/// the prompt waits is reported as skipped, never signed unseen.
+#[derive(Debug, Clone)]
+pub struct ResignTarget {
+    pub id: String,
+    pub digest: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ResignSkip {
     pub id: String,
@@ -233,12 +242,15 @@ impl ClaimStore {
             .collect())
     }
 
-    /// Sign every approved claim except `excludes` with the active owner key.
+    /// Sign the confirmed `targets` with the active owner key, except
+    /// `excludes`. A claim whose current digest differs from the confirmed
+    /// one, or that is not in the confirmed list, is skipped and reported.
     /// Re-running is a no-op: a claim already carrying the active key's
     /// signature is reported as already signed and the file is not rewritten.
     pub fn resign_approved(
         &self,
         workspace: &str,
+        targets: &[ResignTarget],
         excludes: &[String],
     ) -> Result<ResignReport, ClaimError> {
         let keys = crate::signing::KeyStore::open(&self.paths)
@@ -259,6 +271,20 @@ impl ClaimStore {
                 report.excluded.push(claim.id.clone());
                 continue;
             }
+            let Some(target) = targets.iter().find(|target| target.id == claim.id) else {
+                report.skipped.push(ResignSkip {
+                    id: claim.id.clone(),
+                    reason: "not in the confirmed list".to_string(),
+                });
+                continue;
+            };
+            if target.digest != claim.verified_digest {
+                report.skipped.push(ResignSkip {
+                    id: claim.id.clone(),
+                    reason: "digest changed since the owner confirmed it".to_string(),
+                });
+                continue;
+            }
             if let Err(err) = verify_claim_digest(claim) {
                 report.skipped.push(ResignSkip {
                     id: claim.id.clone(),
@@ -277,6 +303,18 @@ impl ClaimStore {
                 continue;
             }
             pending.push(signed);
+        }
+        for target in targets {
+            let still_approved = scan
+                .claims
+                .iter()
+                .any(|claim| claim.id == target.id && claim.status == CLAIM_STATUS_APPROVED);
+            if !still_approved && !report.excluded.contains(&target.id) {
+                report.skipped.push(ResignSkip {
+                    id: target.id.clone(),
+                    reason: "no longer an approved claim".to_string(),
+                });
+            }
         }
         for id in excludes {
             if !report.excluded.contains(id) {

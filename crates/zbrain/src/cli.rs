@@ -889,6 +889,15 @@ impl App {
                 canonical_draft_digest: candidate.digest.clone(),
             })
             .collect();
+        // The confirmed (id, digest) pairs are the whole mandate: a claim
+        // written or changed while the prompt waits is skipped, not signed.
+        let targets: Vec<crate::lifecycle::ResignTarget> = to_sign
+            .iter()
+            .map(|candidate| crate::lifecycle::ResignTarget {
+                id: candidate.id.clone(),
+                digest: candidate.digest.clone(),
+            })
+            .collect();
         let action_digest =
             crate::approval::compute_challenge_action_digest(&crate::approval::ChallengePrepare {
                 workspace: workspace.clone(),
@@ -912,7 +921,7 @@ impl App {
         }
         let _ = writeln!(self.stderr);
         let report = store
-            .resign_approved(&workspace, &excludes)
+            .resign_approved(&workspace, &targets, &excludes)
             .map_err(|err| CliError::failure(err.to_string()))?;
         IndexStore::new(self.paths.clone())
             .mark_dirty(&workspace)
