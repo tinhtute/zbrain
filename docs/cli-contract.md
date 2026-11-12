@@ -18,8 +18,8 @@ zbrain follows **stdout = protocol, stderr = diagnostics** (see `AGENTS.md` Work
 
 | Stream | Content | Examples |
 |---|---|---|
-| `Stdout` | Machine-parseable JSON (via `writeJSON`) and `--help` usage text; each success prints a single JSON document + `\n` | `ask`, `claim draft/approve/supersede/revoke`, `evidence add`, `reindex`, `status`, `doctor`, `migrate okf`, `approval show/grant`, `workspace current` |
-| `Stderr` | Human diagnostics and TTY prompts only | `approval grant` and `claim approve`: `action digest: …` / `confirm the last 16 hex…` (`cli.go:369-380`), `mcp serve` diagnostics (`mcp/…`, `Stderr: app.Stderr` at `cli.go:276`) |
+| `Stdout` | Machine-parseable JSON (via `writeJSON`) and `--help` usage text; each success prints a single JSON document + `\n` | `ask`, `claim draft/approve/resign/supersede/revoke`, `evidence add`, `reindex`, `status`, `doctor`, `migrate okf`, `approval show/grant`, `key init`, `workspace current` |
+| `Stderr` | Human diagnostics and TTY prompts only | `approval grant`, `claim approve`, and `claim resign`: `action digest: …` / `confirm the last 16 hex…` (`cli.go:369-380`), `mcp serve` diagnostics (`mcp/…`, `Stderr: app.Stderr` at `cli.go:276`) |
 
 Verification:
 

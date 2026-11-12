@@ -47,7 +47,8 @@ Owner decision, 2026-11-12:
    - The public key and key state live in the key directory, so the anchor has
      the private key's protection. `config.yml` gains no trust data, at most
      `signing: required` (a pin, not an anchor).
-   - Dependencies: `ed25519-dalek` and `sha2`. No platform code.
+   - Dependencies: `ed25519-dalek` and `sha2`, plus `base64` (the on-disk
+     encoding) and `rand_core` (key generation). No platform code.
 2. **Migration: re-sign through one batch owner ceremony.** It lists id, title,
    `verified.at` and digest for every approved claim and lets the owner exclude
    any. Legacy claims stay unsigned and untrusted until re-signed; `doctor`
@@ -79,17 +80,19 @@ the same T1 limit.
 ### How smoke and CI approve without weakening production
 
 - `make smoke` and tests run with a temp `ZBRAIN_HOME` and a temp
-  `ZBRAIN_KEY_DIR`. They generate a throwaway key there and approve with it.
-  Their anchor is the throwaway public key, so a smoke-signed claim is invalid
-  under the owner's real home and vice versa.
+  `XDG_CONFIG_HOME`, so the key directory resolves under the temp root. They
+  generate a throwaway key there and approve with it. Their anchor is the
+  throwaway public key, so a smoke-signed claim is invalid under the owner's
+  real home and vice versa.
 - Production never honors a key override that points inside the real
   `ZBRAIN_HOME`, and never falls back to an unsigned approval when the signer is
   missing: it fails closed.
 - `scripts/owner-approve.py` keeps driving the pty ceremony; the ceremony then
   signs with the test key. The ceremony and the signature are separate gates:
   the TTY confirms presence, the key proves authorship.
-- The key override env var is a convenience for tests. An agent can set it, but
-  it only selects a different trust root, not the owner's.
+- `XDG_CONFIG_HOME` is the only key-path input: there is no `ZBRAIN_KEY_DIR`
+  override and no flag. An agent can set it, but it only selects a different
+  trust root, not the owner's.
 
 ## Considered
 

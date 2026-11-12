@@ -1600,12 +1600,13 @@ pub(crate) mod test_support {
         let dir = std::env::temp_dir().join(format!("zbrain-index-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let paths = Paths::resolve(Options {
+        let mut paths = Paths::resolve(Options {
             cwd: Some(dir.clone()),
             home_dir: Some(dir.clone()),
             runtime_dir: Some(dir.join(".zbrain")),
         })
         .unwrap();
+        paths.key_dir = crate::signing::test_key_dir();
         ensure_config(&paths.config_file).unwrap();
         crate::workspace::create_workspace(&paths, "research", &FixedClock::new(fixed_index_now()))
             .unwrap();
@@ -1654,6 +1655,7 @@ pub(crate) mod test_support {
         claim.verified_digest = String::new();
         let digest = crate::claims::claim_verification_digest(&claim).unwrap();
         claim.verified_digest = digest;
+        crate::signing::sign_test_claim(&mut claim);
         claim
     }
 
@@ -1931,6 +1933,7 @@ mod tests {
             ..crate::claims::ClaimTransition::default()
         }];
         approved.verified_digest = crate::claims::claim_verification_digest(&approved).unwrap();
+        crate::signing::sign_test_claim(&mut approved);
         let target = crate::claims::render_claim_markdown(&approved).unwrap();
         transition::write_pending_transition(
             &paths,
@@ -2225,6 +2228,7 @@ mod tests {
         let mut approved = claim_store.approve("research", &claim.id).unwrap();
         approved.sources[0].digest = format!("sha256:{}", evidence.sha256);
         approved.verified_digest = crate::claims::claim_verification_digest(&approved).unwrap();
+        crate::signing::sign_test_claim(&mut approved);
         let claim_path = paths
             .workspaces_dir
             .join("research/wiki/projects")
@@ -2262,6 +2266,7 @@ mod tests {
         let mut approved = claim_store.approve("research", &claim.id).unwrap();
         approved.evidence_ids = vec![evidence.id.clone(), evidence.id.clone()];
         approved.verified_digest = crate::claims::claim_verification_digest(&approved).unwrap();
+        crate::signing::sign_test_claim(&mut approved);
         let claim_path = paths
             .workspaces_dir
             .join("research/wiki/projects")
@@ -3010,12 +3015,13 @@ mod tests {
         std::fs::create_dir_all(&real_root).unwrap();
         let linked_root = dir.join("linked");
         std::os::unix::fs::symlink(&real_root, &linked_root).unwrap();
-        let paths = crate::paths::Paths::resolve(crate::paths::Options {
+        let mut paths = crate::paths::Paths::resolve(crate::paths::Options {
             cwd: Some(linked_root.clone()),
             home_dir: Some(linked_root.clone()),
             runtime_dir: Some(linked_root.join(".zbrain")),
         })
         .unwrap();
+        paths.key_dir = crate::signing::test_key_dir();
         crate::config::ensure_config(&paths.config_file).unwrap();
         crate::workspace::create_workspace(&paths, "research", &FixedClock::new(fixed_index_now()))
             .unwrap();

@@ -67,19 +67,23 @@ fn ask_p95_bench() {
     let dir = std::env::temp_dir().join(format!("zbrain-bench-{}-100k", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let paths = zbrain::paths::Paths::resolve(Options {
+    let mut paths = zbrain::paths::Paths::resolve(Options {
         cwd: Some(dir.clone()),
         home_dir: Some(dir.clone()),
         runtime_dir: Some(dir.join(".zbrain")),
     })
     .unwrap();
+    paths.key_dir = dir.join("xdg/zbrain-keys");
     ensure_config(&paths.config_file).unwrap();
     create_workspace(&paths, "research", &FixedClock::new(fixed_bench_now())).unwrap();
+    zbrain::signing::KeyStore::init(&paths, fixed_bench_now()).unwrap();
+    let keys = zbrain::signing::KeyStore::open(&paths).unwrap();
 
     let projects_dir = paths.workspaces_dir.join("research/wiki/projects");
     let build_start = Instant::now();
     for index in 0..corpus_size {
-        let claim = bench_claim(index);
+        let mut claim = bench_claim(index);
+        zbrain::signing::sign_claim(&mut claim, &keys).expect("sign bench claim");
         let path = projects_dir.join(format!("{}.md", claim.id));
         write_claim_atomic(&path, &claim).expect("write bench claim");
     }

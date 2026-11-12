@@ -49,12 +49,13 @@ fn fixture(name: &str) -> Fixture {
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let paths = Paths::resolve(Options {
+    let mut paths = Paths::resolve(Options {
         cwd: Some(dir.join("project")),
         home_dir: Some(dir.clone()),
         runtime_dir: Some(dir.join(".zbrain")),
     })
     .unwrap();
+    paths.key_dir = dir.join("xdg/zbrain-keys");
     ensure_config(&paths.config_file).unwrap();
     extract_bundled_assets(&paths).unwrap();
     create_workspace(
@@ -63,6 +64,8 @@ fn fixture(name: &str) -> Fixture {
         &FixedClock::new(Utc.with_ymd_and_hms(2026, 8, 1, 9, 0, 0).unwrap()),
     )
     .unwrap();
+    zbrain::signing::KeyStore::init(&paths, Utc.with_ymd_and_hms(2026, 8, 1, 9, 0, 0).unwrap())
+        .unwrap();
     Fixture { dir, paths }
 }
 
@@ -100,6 +103,8 @@ fn claim_path(fx: &Fixture, id: &str) -> PathBuf {
 /// recorded digest covers the approved text.
 fn write_claim(fx: &Fixture, claim: &mut Claim) {
     claim.verified_digest = claim_verification_digest(claim).unwrap();
+    let keys = zbrain::signing::KeyStore::open(&fx.paths).unwrap();
+    zbrain::signing::sign_claim(claim, &keys).unwrap();
     let rendered = render_claim_markdown(claim).unwrap();
     let dir = fx.paths.workspaces_dir.join("research/wiki/projects");
     std::fs::create_dir_all(&dir).unwrap();
@@ -182,6 +187,7 @@ fn registry(fx: &Fixture) -> ZbrainRegistry {
 fn status_json(fx: &Fixture) -> serde_json::Value {
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_zbrain"))
         .env("ZBRAIN_HOME", &fx.paths.runtime_dir)
+        .env("XDG_CONFIG_HOME", fx.paths.key_dir.parent().unwrap())
         .args(["status", "--workspace", "research"])
         .output()
         .unwrap();
@@ -326,5 +332,174 @@ fn viewer_list_omits_claim_with_broken_evidence_closure() {
     assert!(
         body.contains(CONTROL_ID),
         "viewer dropped the untampered claim: {body}"
+    );
+}
+
+const UNSIGNED_ID: &str = "clm_00000000000000000000000000000004";
+const BAD_SIGNATURE_ID: &str = "clm_00000000000000000000000000000005";
+
+/// A pre-migration claim: approved and digest-correct, but no signature. It
+/// must be untrusted on every surface, exactly like a tampered one.
+fn write_unsigned_claim(fx: &Fixture, claim: &mut Claim) {
+    claim.verified_digest = claim_verification_digest(claim).unwrap();
+    let rendered = render_claim_markdown(claim).unwrap();
+    let dir = fx.paths.workspaces_dir.join("research/wiki/projects");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(claim_path(fx, &claim.id), rendered).unwrap();
+}
+
+/// Repro 01 with the signature flipped: the digest still matches, only the
+/// signature is wrong, so only the signature check can catch it.
+fn tamper_signature(fx: &Fixture, id: &str) {
+    let path = claim_path(fx, id);
+    let contents = std::fs::read_to_string(&path).unwrap();
+    let marker = "    sig: ";
+    let start = contents.find(marker).expect("claim has no signature") + marker.len();
+    let end = start + contents[start..].find('\n').unwrap();
+    let mut signature: Vec<u8> = contents[start..end].bytes().collect();
+    signature[0] = if signature[0] == b'A' { b'B' } else { b'A' };
+    let tampered = format!(
+        "{}{}{}",
+        &contents[..start],
+        String::from_utf8(signature).unwrap(),
+        &contents[end..]
+    );
+    std::fs::write(&path, tampered).unwrap();
+}
+
+/// One control claim plus one unsigned legacy claim, index never rebuilt.
+fn unsigned_workspace(name: &str) -> Fixture {
+    let fx = fixture(name);
+    let mut control = approved_claim(
+        CONTROL_ID,
+        "Deploy window",
+        "the deploy window is tuesday\n",
+    );
+    write_claim(&fx, &mut control);
+    let mut legacy = approved_claim(UNSIGNED_ID, "Legacy fact", "legacy unsigned body\n");
+    write_unsigned_claim(&fx, &mut legacy);
+    fx
+}
+
+/// One control claim plus one claim whose signature was flipped after
+/// approval, in a workspace whose index was clean when the tamper happened.
+fn bad_signature_workspace(name: &str) -> Fixture {
+    let fx = fixture(name);
+    let mut control = approved_claim(
+        CONTROL_ID,
+        "Deploy window",
+        "the deploy window is tuesday\n",
+    );
+    let mut forged = approved_claim(BAD_SIGNATURE_ID, "Forged fact", "forged signature body\n");
+    write_claim(&fx, &mut control);
+    write_claim(&fx, &mut forged);
+    rebuild(&fx);
+    tamper_signature(&fx, BAD_SIGNATURE_ID);
+    fx
+}
+
+#[test]
+fn viewer_list_omits_unsigned_claim() {
+    let fx = unsigned_workspace("viewer-list-unsigned");
+    let (status, body) = with_viewer(&fx, |url| http_get(url, "/api/claims"));
+    assert_eq!(status, 200, "body: {body}");
+    assert!(
+        !body.contains(UNSIGNED_ID),
+        "viewer served an unsigned claim: {body}"
+    );
+    assert!(
+        body.contains(CONTROL_ID),
+        "viewer dropped the signed claim: {body}"
+    );
+}
+
+#[test]
+fn viewer_claim_endpoint_refuses_unsigned_claim() {
+    let fx = unsigned_workspace("viewer-claim-unsigned");
+    let (status, body) = with_viewer(&fx, |url| {
+        http_get(url, &format!("/api/claim/{UNSIGNED_ID}"))
+    });
+    assert_eq!(status, 404, "unsigned claim body: {body}");
+    assert!(
+        !body.contains("legacy unsigned body"),
+        "viewer served the unsigned body: {body}"
+    );
+}
+
+#[test]
+fn mcp_claim_resource_refuses_unsigned_claim() {
+    let fx = unsigned_workspace("mcp-resource-unsigned");
+    let registry = registry(&fx);
+    let uri = format!("zbrain://workspace/research/claim/{UNSIGNED_ID}");
+    assert!(
+        registry.read_resource(&uri).is_none(),
+        "MCP resource served an unsigned claim"
+    );
+    let control_uri = format!("zbrain://workspace/research/claim/{CONTROL_ID}");
+    assert!(
+        registry.read_resource(&control_uri).is_some(),
+        "MCP resource dropped the signed claim"
+    );
+}
+
+#[test]
+fn status_reports_unsigned_claim_as_invalid() {
+    let fx = unsigned_workspace("status-unsigned");
+    let value = status_json(&fx);
+    assert_eq!(value["approved"], 1, "approved count: {value}");
+    assert_eq!(value["invalid"], 1, "invalid count: {value}");
+    let invalid = value["invalid_claims"].as_array().unwrap();
+    assert_eq!(invalid[0]["path"], format!("projects/{UNSIGNED_ID}.md"));
+    assert!(
+        invalid[0]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("unsigned"),
+        "invalid error: {invalid:?}"
+    );
+}
+
+#[test]
+fn viewer_list_omits_claim_with_a_bad_signature() {
+    let fx = bad_signature_workspace("viewer-list-badsig");
+    let (status, body) = with_viewer(&fx, |url| http_get(url, "/api/claims"));
+    assert_eq!(status, 200, "body: {body}");
+    assert!(
+        !body.contains(BAD_SIGNATURE_ID),
+        "viewer served a claim with a bad signature: {body}"
+    );
+    assert!(
+        body.contains(CONTROL_ID),
+        "viewer dropped the signed claim: {body}"
+    );
+}
+
+#[test]
+fn mcp_claim_resource_refuses_claim_with_a_bad_signature() {
+    let fx = bad_signature_workspace("mcp-resource-badsig");
+    let uri = format!("zbrain://workspace/research/claim/{BAD_SIGNATURE_ID}");
+    assert!(
+        registry(&fx).read_resource(&uri).is_none(),
+        "MCP resource served a claim with a bad signature"
+    );
+}
+
+#[test]
+fn status_reports_a_bad_signature_as_invalid() {
+    let fx = bad_signature_workspace("status-badsig");
+    let value = status_json(&fx);
+    assert_eq!(value["approved"], 1, "approved count: {value}");
+    assert_eq!(value["invalid"], 1, "invalid count: {value}");
+    let invalid = value["invalid_claims"].as_array().unwrap();
+    assert_eq!(
+        invalid[0]["path"],
+        format!("projects/{BAD_SIGNATURE_ID}.md")
+    );
+    assert!(
+        invalid[0]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("signature"),
+        "invalid error: {invalid:?}"
     );
 }

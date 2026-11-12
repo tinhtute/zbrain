@@ -620,6 +620,12 @@ fn validate_indexed_claim_binding_internal(
             indexed.id
         ))
     })?;
+    crate::signing::verify_claim_signature_at(paths, &canonical).map_err(|err| {
+        IndexError::Message(format!(
+            "approved claim {:?} approval signature failed: {err}",
+            indexed.id
+        ))
+    })?;
     if canonical.evidence_ids.is_empty() && canonical.supporting_claim_ids.is_empty() {
         return Ok(());
     }
@@ -766,6 +772,8 @@ fn verify_claim_trust_at(
     if digest != claim.verified_digest {
         return Err(format!("claim {:?} verification digest mismatch", claim.id));
     }
+    crate::signing::verify_claim_signature_at(paths, claim)
+        .map_err(|err| format!("claim {:?} approval signature: {err}", claim.id))?;
     if !approved.evidence_ids.is_empty() {
         let mut evidence_validator =
             EvidenceValidator::new(paths.clone(), workspace).map_err(|err| {
@@ -1223,12 +1231,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("zbrain-query-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let paths = Paths::resolve(Options {
+        let mut paths = Paths::resolve(Options {
             cwd: Some(dir.join("project")),
             home_dir: Some(dir.clone()),
             runtime_dir: Some(dir.join(".zbrain")),
         })
         .unwrap();
+        paths.key_dir = crate::signing::test_key_dir();
         crate::config::ensure_config(&paths.config_file).unwrap();
         crate::workspace::create_workspace(&paths, "research", &FixedClock::new(fixed_query_now()))
             .unwrap();
@@ -1274,6 +1283,7 @@ mod tests {
         claim.verified_by = "owner".into();
         claim.verified_digest = String::new();
         claim.verified_digest = claim_verification_digest(&claim).unwrap();
+        crate::signing::sign_test_claim(&mut claim);
         claim
     }
 
@@ -3046,6 +3056,70 @@ mod tests {
             "withInclude claims = {:?}",
             with_include.claims
         );
+        let _ = std::fs::remove_dir_all(&_dir);
+    }
+
+    /// The verification digest blanks `verified.*`, so a flipped signature
+    /// keeps the digest intact. Only the signature check in the canonical
+    /// binding rejects it, and the query must fail closed rather than serve
+    /// the claim.
+    #[test]
+    fn canonical_index_binding_rejects_a_bad_signature() {
+        let (_dir, paths) = query_test_paths("binding-bad-signature");
+        let claim_store = query_claim_store(&paths);
+        let id = "clm_99999999999999999999999999999999";
+        let mut claim = query_claim(id, "Signed binding marker", CLAIM_BASIS_OWNER);
+        claim.body = "signed binding query marker\n".into();
+        claim_store.write_draft("research", claim).unwrap();
+        claim_store.approve("research", id).unwrap();
+        store(&paths).rebuild("research").unwrap();
+        let indexed = store(&paths)
+            .search(
+                "research",
+                search_opts("signed binding", vec![CLAIM_STATUS_APPROVED], 10),
+            )
+            .unwrap();
+        assert_eq!(indexed.len(), 1);
+
+        let path = paths
+            .workspaces_dir
+            .join("research/wiki/projects")
+            .join(format!("{id}.md"));
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let marker = "    sig: ";
+        let start = contents
+            .find(marker)
+            .expect("approved claim carries a signature")
+            + marker.len();
+        let end = start + contents[start..].find('\n').unwrap();
+        let mut signature: Vec<u8> = contents[start..end].bytes().collect();
+        signature[0] = if signature[0] == b'A' { b'B' } else { b'A' };
+        std::fs::write(
+            &path,
+            format!(
+                "{}{}{}",
+                &contents[..start],
+                String::from_utf8(signature).unwrap(),
+                &contents[end..]
+            ),
+        )
+        .unwrap();
+        let manifest = build_trust_input_manifest(&paths, "research").unwrap();
+
+        let err = validate_indexed_claim_binding(&paths, "research", &indexed[0], Some(&manifest))
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("approval signature"), "{message}");
+        assert!(message.contains(id), "{message}");
+        assert!(trusted_query(
+            &paths,
+            TrustedQueryOptions {
+                query: "signed binding".into(),
+                limit: 10,
+                ..TrustedQueryOptions::default()
+            },
+        )
+        .is_err());
         let _ = std::fs::remove_dir_all(&_dir);
     }
 }

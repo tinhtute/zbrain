@@ -1709,12 +1709,13 @@ mod tests {
             std::env::temp_dir().join(format!("zbrain-approval-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let paths = Paths::resolve(Options {
+        let mut paths = Paths::resolve(Options {
             cwd: Some(dir.clone()),
             home_dir: Some(dir.clone()),
             runtime_dir: Some(dir.join(".zbrain")),
         })
         .unwrap();
+        paths.key_dir = crate::signing::test_key_dir();
         ensure_config(&paths.config_file).unwrap();
         let clock = FixedClock::new(fixed_now());
         create_workspace(&paths, "research", &clock).unwrap();
@@ -1790,6 +1791,7 @@ mod tests {
         approved.verified_by = "owner".to_string();
         approved.verified_digest = String::new();
         approved.verified_digest = claim_verification_digest(&approved).unwrap();
+        crate::signing::sign_test_claim(&mut approved);
         approved
     }
 

@@ -50,15 +50,17 @@ fn eval_paths(name: &str) -> (std::path::PathBuf, Paths) {
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let paths = Paths::resolve(Options {
+    let mut paths = Paths::resolve(Options {
         cwd: Some(dir.join("project")),
         home_dir: Some(dir.clone()),
         runtime_dir: Some(dir.join(".zbrain")),
     })
     .unwrap();
+    paths.key_dir = dir.join("xdg/zbrain-keys");
     ensure_config(&paths.config_file).unwrap();
     zbrain::assets::extract_bundled_assets(&paths).unwrap();
     create_workspace(&paths, "research", &FixedClock::new(eval_now())).unwrap();
+    zbrain::signing::KeyStore::init(&paths, eval_now()).unwrap();
     (dir, paths)
 }
 

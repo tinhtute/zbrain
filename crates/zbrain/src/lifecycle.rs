@@ -29,6 +29,43 @@ use crate::transition::{
 };
 use crate::trust::TrustValidator;
 
+/// One approved claim listed by the batch re-sign ceremony.
+#[derive(Debug, Clone, Serialize)]
+pub struct ResignCandidate {
+    pub id: String,
+    pub title: String,
+    pub verified_at: String,
+    pub verified_by: String,
+    pub digest: String,
+}
+
+/// One claim the owner confirmed in the re-sign ceremony: id, digest, and the
+/// `verified.at`/`verified.by` the listing showed. The digest blanks
+/// `verified.*`, so those two fields are compared separately; the ceremony
+/// signs only exact matches and reports anything else as skipped, never
+/// signed unseen.
+#[derive(Debug, Clone)]
+pub struct ResignTarget {
+    pub id: String,
+    pub digest: String,
+    pub verified_at: String,
+    pub verified_by: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResignSkip {
+    pub id: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ResignReport {
+    pub signed: Vec<String>,
+    pub already_signed: Vec<String>,
+    pub excluded: Vec<String>,
+    pub skipped: Vec<ResignSkip>,
+}
+
 /// Provenance for callers that execute a lifecycle transition through a
 /// prepared owner challenge. Empty options keep the existing CLI owner
 /// provenance and serialized shape.
@@ -147,6 +184,14 @@ impl ClaimStore {
         });
         let digest = claim_verification_digest(&claim)?;
         claim.verified_digest = digest;
+        // The owner ceremony is the only place an approved claim is born:
+        // sign the verified block here so every approval path (claim approve,
+        // claim_lifecycle apply, supersede) carries a signature. A missing or
+        // invalid key fails before the challenge token is consumed.
+        let keys = crate::signing::KeyStore::open(&self.paths)
+            .map_err(|err| message(format!("approval signing key unavailable: {err}")))?;
+        crate::signing::sign_claim(&mut claim, &keys)
+            .map_err(|err| message(format!("sign approved claim: {err}")))?;
 
         for old in &mut old_claims {
             old.status = CLAIM_STATUS_SUPERSEDED.to_string();
@@ -184,6 +229,126 @@ impl ClaimStore {
         run_workspace_generation_test_hook(WORKSPACE_GENERATION_HOOK_BEFORE_CANONICAL_WRITE);
         self.write_existing(workspace, &plan.claim)?;
         Ok(plan.claim)
+    }
+
+    /// Approved claims the batch re-sign ceremony will walk, in path order.
+    pub fn resign_candidates(&self, workspace: &str) -> Result<Vec<ResignCandidate>, ClaimError> {
+        let scan = self.scan_workspace_inner(workspace, false)?;
+        Ok(scan
+            .claims
+            .iter()
+            .filter(|claim| claim.status == CLAIM_STATUS_APPROVED)
+            .map(|claim| ResignCandidate {
+                id: claim.id.clone(),
+                title: claim.title.clone(),
+                verified_at: claim.verified_at.clone(),
+                verified_by: claim.verified_by.clone(),
+                digest: claim.verified_digest.clone(),
+            })
+            .collect())
+    }
+
+    /// Sign the confirmed `targets` with the active owner key, except
+    /// `excludes`. A claim whose current digest differs from the confirmed
+    /// one, or that is not in the confirmed list, is skipped and reported.
+    /// Re-running is a no-op: a claim already carrying the active key's
+    /// signature is reported as already signed and the file is not rewritten.
+    pub fn resign_approved(
+        &self,
+        workspace: &str,
+        targets: &[ResignTarget],
+        excludes: &[String],
+    ) -> Result<ResignReport, ClaimError> {
+        let keys = crate::signing::KeyStore::open(&self.paths)
+            .map_err(|err| message(format!("approval signing key unavailable: {err}")))?;
+        let _lock = crate::coordination::acquire_workspace_lock(&self.paths, workspace, true)
+            .map_err(message)?;
+        recover_pending_transition_for_mutation_unlocked(&self.paths, workspace)
+            .map_err(message)?;
+        let scan = self.scan_workspace_inner(workspace, false)?;
+        let mut report = ResignReport::default();
+        let mut pending: Vec<Claim> = Vec::new();
+        for claim in scan
+            .claims
+            .iter()
+            .filter(|claim| claim.status == CLAIM_STATUS_APPROVED)
+        {
+            if excludes.iter().any(|id| id == &claim.id) {
+                report.excluded.push(claim.id.clone());
+                continue;
+            }
+            let Some(target) = targets.iter().find(|target| target.id == claim.id) else {
+                report.skipped.push(ResignSkip {
+                    id: claim.id.clone(),
+                    reason: "not in the confirmed list".to_string(),
+                });
+                continue;
+            };
+            if target.digest != claim.verified_digest {
+                report.skipped.push(ResignSkip {
+                    id: claim.id.clone(),
+                    reason: "digest changed since the owner confirmed it".to_string(),
+                });
+                continue;
+            }
+            // The digest blanks `verified.*`, so the approval time and
+            // approver must be compared on their own: the signature binds
+            // whatever values are on disk at signing time.
+            if target.verified_at != claim.verified_at || target.verified_by != claim.verified_by {
+                report.skipped.push(ResignSkip {
+                    id: claim.id.clone(),
+                    reason: "approval time or approver changed since the owner confirmed it"
+                        .to_string(),
+                });
+                continue;
+            }
+            if let Err(err) = verify_claim_digest(claim) {
+                report.skipped.push(ResignSkip {
+                    id: claim.id.clone(),
+                    reason: err.to_string(),
+                });
+                continue;
+            }
+            let mut signed = claim.clone();
+            crate::signing::sign_claim(&mut signed, &keys)
+                .map_err(|err| message(format!("sign claim {}: {err}", claim.id)))?;
+            if signed.verified_alg == claim.verified_alg
+                && signed.verified_key_id == claim.verified_key_id
+                && signed.verified_sig == claim.verified_sig
+            {
+                report.already_signed.push(claim.id.clone());
+                continue;
+            }
+            pending.push(signed);
+        }
+        for target in targets {
+            let still_approved = scan
+                .claims
+                .iter()
+                .any(|claim| claim.id == target.id && claim.status == CLAIM_STATUS_APPROVED);
+            if !still_approved && !report.excluded.contains(&target.id) {
+                report.skipped.push(ResignSkip {
+                    id: target.id.clone(),
+                    reason: "no longer an approved claim".to_string(),
+                });
+            }
+        }
+        for id in excludes {
+            if !report.excluded.contains(id) {
+                report.skipped.push(ResignSkip {
+                    id: id.clone(),
+                    reason: "no approved claim with this id".to_string(),
+                });
+            }
+        }
+        if !pending.is_empty() {
+            begin_canonical_mutation_unlocked(&self.paths, workspace).map_err(message)?;
+            for claim in &pending {
+                self.write_existing(workspace, claim)?;
+                report.signed.push(claim.id.clone());
+            }
+        }
+        Ok(report)
     }
 
     pub fn revoke(&self, workspace: &str, id: &str, reason: &str) -> Result<Claim, ClaimError> {
@@ -508,12 +673,13 @@ mod tests {
             std::env::temp_dir().join(format!("zbrain-lifecycle-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let paths = Paths::resolve(Options {
+        let mut paths = Paths::resolve(Options {
             cwd: Some(dir.clone()),
             home_dir: Some(dir.clone()),
             runtime_dir: Some(dir.join(".zbrain")),
         })
         .unwrap();
+        paths.key_dir = crate::signing::test_key_dir();
         ensure_config(&paths.config_file).unwrap();
         let clock = FixedClock::new(fixed_now());
         crate::workspace::create_workspace(&paths, "research", &clock).unwrap();
@@ -550,6 +716,7 @@ mod tests {
         approved.verified_by = "owner".to_string();
         approved.verified_digest = String::new();
         approved.verified_digest = claim_verification_digest(&approved).unwrap();
+        crate::signing::sign_test_claim(&mut approved);
         approved
     }
 
