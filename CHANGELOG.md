@@ -70,6 +70,12 @@
 - The viewer accepts only `Host: 127.0.0.1:<port>` or `localhost:<port>` for
   its bound port, closing DNS-rebinding reads. A missing `Host` gets 400; any
   other host, port, or a repeated `Host` gets 421 with an empty body.
+  `view --help`, the site docs, and the gateway spec state the rule.
+- When a rejected index has both a non-claim wiki file and other invalid trust
+  inputs, the error now says so ("N other invalid trust inputs also block the
+  index; zbrain reindex lists them") and `doctor`'s `next_action` names both
+  fixes, so moving the file is not presented as the whole fix. The count comes
+  from the last rebuild, so it can lag wiki files added or removed since.
 
 ## 0.4.0 (2026-09-06) — Rust cutover
 

@@ -1568,7 +1568,7 @@ impl App {
     fn print_view_help(&mut self) {
         let _ = write!(
             self.stdout,
-            "Usage: zbrain view\n\nServe the embedded read-only viewer over loopback (127.0.0.1).\n\nThe viewer binds loopback only, sends strict CSP and nosniff headers,\nhas no CORS, and returns 405 for every method other than GET and HEAD.\n"
+            "Usage: zbrain view\n\nServe the embedded read-only viewer over loopback (127.0.0.1).\n\nThe viewer binds loopback only, accepts only Host 127.0.0.1:<port> or\nlocalhost:<port>, sends strict CSP and nosniff headers, has no CORS, and\nreturns 405 for every method other than GET and HEAD.\n"
         );
     }
 
