@@ -80,8 +80,9 @@ impl Server {
             match listener.accept() {
                 Ok((stream, _)) => {
                     let paths = self.paths.clone();
+                    let port = self.port;
                     std::thread::spawn(move || {
-                        let _ = handle_connection(stream, &paths);
+                        let _ = handle_connection(stream, &paths, port);
                     });
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
@@ -98,7 +99,7 @@ impl Server {
     }
 }
 
-fn handle_connection(mut stream: TcpStream, paths: &Paths) -> std::io::Result<()> {
+fn handle_connection(mut stream: TcpStream, paths: &Paths, port: u16) -> std::io::Result<()> {
     // Accepted streams inherit the listener's non-blocking mode; the handler
     // below is written as blocking I/O, so restore blocking mode first.
     // Without this, a read racing the client's write returns WouldBlock and
@@ -119,16 +120,46 @@ fn handle_connection(mut stream: TcpStream, paths: &Paths) -> std::io::Result<()
             break;
         }
     }
-    let response = route_request(&buf, paths);
+    let response = route_request(&buf, paths, port);
     stream.write_all(&response)?;
     stream.flush()?;
     Ok(())
 }
 
-fn route_request(raw: &[u8], paths: &Paths) -> Vec<u8> {
+/// Accepts only `127.0.0.1:<port>` or `localhost:<port>` (host part
+/// case-insensitive) so a DNS-rebound page cannot read from the viewer.
+fn host_allowed(value: &str, port: u16) -> bool {
+    let Some((host, host_port)) = value.trim().rsplit_once(':') else {
+        return false;
+    };
+    (host.eq_ignore_ascii_case("127.0.0.1") || host.eq_ignore_ascii_case("localhost"))
+        && host_port == port.to_string()
+}
+
+fn route_request(raw: &[u8], paths: &Paths, port: u16) -> Vec<u8> {
     let text = String::from_utf8_lossy(raw);
     let mut lines = text.split("\r\n");
     let request_line = lines.next().unwrap_or("");
+    let hosts: Vec<&str> = lines
+        .by_ref()
+        .take_while(|line| !line.is_empty())
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(name, _)| name.trim().eq_ignore_ascii_case("host"))
+        .map(|(_, value)| value)
+        .collect();
+    match hosts.as_slice() {
+        [] => return http_response(400, "Bad Request", "text/plain; charset=utf-8", b"", "GET"),
+        [one] if host_allowed(one, port) => {}
+        _ => {
+            return http_response(
+                421,
+                "Misdirected Request",
+                "text/plain; charset=utf-8",
+                b"",
+                "GET",
+            )
+        }
+    }
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("");
@@ -822,6 +853,10 @@ mod tests {
     }
 
     fn request(port: u16, method: &str, path: &str) -> HttpResponse {
+        request_with_host(port, method, path, Some(&format!("127.0.0.1:{port}")))
+    }
+
+    fn request_with_host(port: u16, method: &str, path: &str, host: Option<&str>) -> HttpResponse {
         // Readiness probe: the serve thread may not have reached accept()
         // yet under parallel-test load. Bound sockets queue the handshake,
         // but retrying connect removes all startup timing from the test.
@@ -839,8 +874,8 @@ mod tests {
         stream
             .set_read_timeout(Some(Duration::from_secs(30)))
             .unwrap();
-        let text =
-            format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+        let host_line = host.map(|h| format!("Host: {h}\r\n")).unwrap_or_default();
+        let text = format!("{method} {path} HTTP/1.1\r\n{host_line}Connection: close\r\n\r\n");
         stream.write_all(text.as_bytes()).unwrap();
         let mut raw = Vec::new();
         stream.read_to_end(&mut raw).unwrap();
@@ -911,7 +946,11 @@ mod tests {
         let body = render_page(&paths).unwrap();
         let text = String::from_utf8(body).unwrap();
         assert!(text.contains("zbrain"));
-        let response = route_request(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n", &paths);
+        let response = route_request(
+            b"GET / HTTP/1.1\r\nHost: 127.0.0.1:4000\r\n\r\n",
+            &paths,
+            4000,
+        );
         let text = String::from_utf8(response).unwrap();
         assert!(text.starts_with("HTTP/1.1 200 OK"));
         assert!(text.contains(
@@ -927,8 +966,8 @@ mod tests {
         for method in [
             "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "TRACE", "CONNECT", "BREW",
         ] {
-            let raw = format!("{method} / HTTP/1.1\r\nHost: x\r\n\r\n");
-            let response = route_request(raw.as_bytes(), &paths);
+            let raw = format!("{method} / HTTP/1.1\r\nHost: localhost:4000\r\n\r\n");
+            let response = route_request(raw.as_bytes(), &paths, 4000);
             let text = String::from_utf8(response).unwrap();
             assert!(text.starts_with("HTTP/1.1 405"), "{method}: {text}");
             assert!(text.contains("Content-Security-Policy:"), "{method}");
@@ -939,8 +978,8 @@ mod tests {
     fn unknown_paths_are_404() {
         let (_dir, paths) = test_paths("404");
         for path in ["/missing.html", "/index.html", "/embed.go"] {
-            let raw = format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n");
-            let response = route_request(raw.as_bytes(), &paths);
+            let raw = format!("GET {path} HTTP/1.1\r\nHost: localhost:4000\r\n\r\n");
+            let response = route_request(raw.as_bytes(), &paths, 4000);
             assert!(
                 String::from_utf8(response)
                     .unwrap()
@@ -957,8 +996,8 @@ mod tests {
             ("/style.css", "text/css; charset=utf-8"),
             ("/app.js", "text/javascript; charset=utf-8"),
         ] {
-            let raw = format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n");
-            let response = route_request(raw.as_bytes(), &paths);
+            let raw = format!("GET {path} HTTP/1.1\r\nHost: localhost:4000\r\n\r\n");
+            let response = route_request(raw.as_bytes(), &paths, 4000);
             let text = String::from_utf8(response).unwrap();
             assert!(text.starts_with("HTTP/1.1 200"), "{path}: {text}");
             assert!(
@@ -1048,8 +1087,8 @@ mod tests {
             "/api/claims",
             "/api/claim/clm_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         ] {
-            let raw = format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n");
-            let response = route_request(raw.as_bytes(), &paths);
+            let raw = format!("GET {path} HTTP/1.1\r\nHost: localhost:4000\r\n\r\n");
+            let response = route_request(raw.as_bytes(), &paths, 4000);
             let text = String::from_utf8(response).unwrap();
             assert!(text.starts_with("HTTP/1.1 200"), "{path}: {text}");
             let body = text.split("\r\n\r\n").nth(1).unwrap_or("");
@@ -1058,8 +1097,8 @@ mod tests {
                 "{path}: {body}"
             );
         }
-        let raw = "GET /api/workspace HTTP/1.1\r\nHost: x\r\n\r\n";
-        let response = String::from_utf8(route_request(raw.as_bytes(), &paths)).unwrap();
+        let raw = "GET /api/workspace HTTP/1.1\r\nHost: localhost:4000\r\n\r\n";
+        let response = String::from_utf8(route_request(raw.as_bytes(), &paths, 4000)).unwrap();
         let body = response.split("\r\n\r\n").nth(1).unwrap_or("");
         let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
         assert_eq!(parsed["workspace"], "research");
@@ -1068,8 +1107,8 @@ mod tests {
     #[test]
     fn head_returns_headers_without_body() {
         let (_dir, paths) = test_paths("head");
-        let raw = "HEAD / HTTP/1.1\r\nHost: x\r\n\r\n";
-        let response = route_request(raw.as_bytes(), &paths);
+        let raw = "HEAD / HTTP/1.1\r\nHost: localhost:4000\r\n\r\n";
+        let response = route_request(raw.as_bytes(), &paths, 4000);
         let text = String::from_utf8(response).unwrap();
         assert!(text.starts_with("HTTP/1.1 200"), "{text}");
         let body = text.split("\r\n\r\n").nth(1).unwrap_or("MISSING");
@@ -1103,6 +1142,53 @@ mod tests {
         assert!(head.body.is_empty());
         let post = request(port, "POST", "/");
         assert_eq!(post.status, 405);
+        stop.store(true, Ordering::SeqCst);
+        serving.join().unwrap();
+    }
+
+    #[test]
+    fn host_header_must_be_loopback_with_bound_port() {
+        let (_dir, paths) = test_paths("host");
+        let now = FixedClock::new(Utc.with_ymd_and_hms(2026, 7, 30, 9, 0, 0).unwrap());
+        crate::workspace::create_workspace(&paths, "research", &now).unwrap();
+        let mut server = Server::new(paths);
+        let url = server.listen().unwrap();
+        let port: u16 = url.rsplit(':').next().unwrap().parse().unwrap();
+        let other = if port == 65535 { port - 1 } else { port + 1 };
+        let stop = server.stop_handle();
+        let serving = std::thread::spawn(move || {
+            let _ = server.serve();
+        });
+        for path in ["/", "/api/workspace", "/api/claims"] {
+            for bad in [
+                "attacker.example".to_string(),
+                format!("attacker.example:{port}"),
+                format!("127.0.0.1:{other}"),
+                "127.0.0.1".to_string(),
+                format!("[::1]:{port}"),
+                format!("localhost.evil:{port}"),
+            ] {
+                let response = request_with_host(port, "GET", path, Some(&bad));
+                assert_eq!(response.status, 421, "{path} Host: {bad}");
+                assert_eq!(response.header("X-Content-Type-Options"), Some("nosniff"));
+                assert!(response.header("Content-Security-Policy").is_some());
+                assert!(response.header("Access-Control-Allow-Origin").is_none());
+                let body = String::from_utf8(response.body).unwrap();
+                assert!(!body.contains("zbrain"), "{path} leaked body: {body}");
+            }
+            let missing = request_with_host(port, "GET", path, None);
+            assert_eq!(missing.status, 400, "{path} without Host");
+        }
+        for good in [
+            format!("127.0.0.1:{port}"),
+            format!("localhost:{port}"),
+            format!("LOCALHOST:{port}"),
+        ] {
+            for path in ["/", "/api/workspace"] {
+                let response = request_with_host(port, "GET", path, Some(&good));
+                assert_eq!(response.status, 200, "{path} Host: {good}");
+            }
+        }
         stop.store(true, Ordering::SeqCst);
         serving.join().unwrap();
     }
