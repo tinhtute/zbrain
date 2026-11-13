@@ -748,6 +748,7 @@ fn verify_claim_trust_at(
         after: None,
         before: None,
         as_of: Some(as_of),
+        now: as_of,
     };
     if !match_temporal_claim(claim, &filter) {
         return Err(format!("claim {:?} was not active at as_of", claim.id));
@@ -928,6 +929,11 @@ fn trusted_claim_at(
     if !match_temporal_claim(&canonical, temporal) {
         return Ok(None);
     }
+    // Without `as_of` the query instant is now; apply the same stale_after
+    // rule the `as_of` path applies so a stale claim is not trusted.
+    if temporal.as_of.is_none() && claim_stale_at(&canonical, temporal.now) {
+        return Ok(None);
+    }
     if let Some(as_of) = temporal.as_of {
         let terminal = canonical.status == crate::claims::CLAIM_STATUS_SUPERSEDED
             || canonical.status == crate::claims::CLAIM_STATUS_REVOKED;
@@ -1057,11 +1063,25 @@ fn read_claim_by_path(paths: &Paths, workspace: &str, relative: &str) -> Result<
         .map_err(|err| IndexError::Message(err.to_string()))
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 struct TemporalFilter {
     after: Option<DateTime<Utc>>,
     before: Option<DateTime<Utc>>,
     as_of: Option<DateTime<Utc>>,
+    /// The query instant used for `stale_after` when `as_of` is absent.
+    now: DateTime<Utc>,
+}
+
+/// A claim is stale at `at` once its `stale_after` is at or before `at`. An
+/// unparseable `stale_after` fails closed as stale.
+fn claim_stale_at(canonical: &Claim, at: DateTime<Utc>) -> bool {
+    if canonical.stale_after.is_empty() {
+        return false;
+    }
+    match parse_rfc3339(&canonical.stale_after) {
+        Ok(stale_time) => stale_time <= at,
+        Err(_) => true,
+    }
 }
 
 fn parse_rfc3339(value: &str) -> Result<DateTime<Utc>, IndexError> {
@@ -1207,7 +1227,12 @@ fn parse_rfc3339_go(value: &str) -> Result<DateTime<Utc>, String> {
 }
 
 fn parse_temporal_options(options: &TrustedQueryOptions) -> Result<TemporalFilter, IndexError> {
-    let mut filter = TemporalFilter::default();
+    let mut filter = TemporalFilter {
+        after: None,
+        before: None,
+        as_of: None,
+        now: crate::clock::Clock::now(&crate::clock::SystemClock),
+    };
     if !options.after.is_empty() {
         filter.after = Some(parse_rfc3339_go(&options.after).map_err(|err| {
             IndexError::Message(format!(
@@ -1262,13 +1287,8 @@ fn match_temporal_claim(canonical: &Claim, filter: &TemporalFilter) -> bool {
         if claim_time > as_of {
             return false;
         }
-        if !canonical.stale_after.is_empty() {
-            let Ok(stale_time) = parse_rfc3339(&canonical.stale_after) else {
-                return false;
-            };
-            if stale_time <= as_of {
-                return false;
-            }
+        if claim_stale_at(canonical, as_of) {
+            return false;
         }
         if canonical.status == crate::claims::CLAIM_STATUS_SUPERSEDED
             || canonical.status == crate::claims::CLAIM_STATUS_REVOKED
