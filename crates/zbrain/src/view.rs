@@ -822,6 +822,10 @@ mod tests {
     }
 
     fn request(port: u16, method: &str, path: &str) -> HttpResponse {
+        request_with_host(port, method, path, Some(&format!("127.0.0.1:{port}")))
+    }
+
+    fn request_with_host(port: u16, method: &str, path: &str, host: Option<&str>) -> HttpResponse {
         // Readiness probe: the serve thread may not have reached accept()
         // yet under parallel-test load. Bound sockets queue the handshake,
         // but retrying connect removes all startup timing from the test.
@@ -839,8 +843,8 @@ mod tests {
         stream
             .set_read_timeout(Some(Duration::from_secs(30)))
             .unwrap();
-        let text =
-            format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+        let host_line = host.map(|h| format!("Host: {h}\r\n")).unwrap_or_default();
+        let text = format!("{method} {path} HTTP/1.1\r\n{host_line}Connection: close\r\n\r\n");
         stream.write_all(text.as_bytes()).unwrap();
         let mut raw = Vec::new();
         stream.read_to_end(&mut raw).unwrap();
@@ -1103,6 +1107,51 @@ mod tests {
         assert!(head.body.is_empty());
         let post = request(port, "POST", "/");
         assert_eq!(post.status, 405);
+        stop.store(true, Ordering::SeqCst);
+        serving.join().unwrap();
+    }
+
+    #[test]
+    fn host_header_must_be_loopback_with_bound_port() {
+        let (_dir, paths) = test_paths("host");
+        let mut server = Server::new(paths);
+        let url = server.listen().unwrap();
+        let port: u16 = url.rsplit(':').next().unwrap().parse().unwrap();
+        let other = if port == 65535 { port - 1 } else { port + 1 };
+        let stop = server.stop_handle();
+        let serving = std::thread::spawn(move || {
+            let _ = server.serve();
+        });
+        for path in ["/", "/api/workspace", "/api/claims"] {
+            for bad in [
+                "attacker.example".to_string(),
+                format!("attacker.example:{port}"),
+                format!("127.0.0.1:{other}"),
+                "127.0.0.1".to_string(),
+                format!("[::1]:{port}"),
+                format!("localhost.evil:{port}"),
+            ] {
+                let response = request_with_host(port, "GET", path, Some(&bad));
+                assert_eq!(response.status, 421, "{path} Host: {bad}");
+                assert_eq!(response.header("X-Content-Type-Options"), Some("nosniff"));
+                assert!(response.header("Content-Security-Policy").is_some());
+                assert!(response.header("Access-Control-Allow-Origin").is_none());
+                let body = String::from_utf8(response.body).unwrap();
+                assert!(!body.contains("zbrain"), "{path} leaked body: {body}");
+            }
+            let missing = request_with_host(port, "GET", path, None);
+            assert_eq!(missing.status, 400, "{path} without Host");
+        }
+        for good in [
+            format!("127.0.0.1:{port}"),
+            format!("localhost:{port}"),
+            format!("LOCALHOST:{port}"),
+        ] {
+            for path in ["/", "/api/workspace"] {
+                let response = request_with_host(port, "GET", path, Some(&good));
+                assert_eq!(response.status, 200, "{path} Host: {good}");
+            }
+        }
         stop.store(true, Ordering::SeqCst);
         serving.join().unwrap();
     }
