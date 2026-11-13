@@ -134,7 +134,9 @@ empty vectors always fall back to lexical retrieval.
 Markdown and raw evidence, sends the strict CSP
 `default-src 'self'; script-src 'none'; object-src 'none'` and
 `X-Content-Type-Options: nosniff`, has no CORS headers, and returns 405 for
-every method other than `GET` and `HEAD`. It uses
+every method other than `GET` and `HEAD`. It accepts only `Host: 127.0.0.1:<port>`
+or `localhost:<port>` for its bound port (missing `Host` is `400`; any other or
+repeated `Host` is `421`). It uses
 the same runtime services as CLI/MCP and exposes no mutation endpoint.
 
 ## Delivered implementation order

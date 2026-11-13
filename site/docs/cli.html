@@ -112,7 +112,7 @@ zbrain &lt;command&gt; --help</code></pre>
         </li>
         <li class="specimen__item">
           <p class="specimen__term">view</p>
-          <p class="specimen__desc"><code>Usage: zbrain view</code><br>Serve the embedded read-only viewer over loopback (127.0.0.1). The viewer binds loopback only, sends strict CSP and nosniff headers, has no CORS, and returns 405 for every method other than GET and HEAD.</p>
+          <p class="specimen__desc"><code>Usage: zbrain view</code><br>Serve the embedded read-only viewer over loopback (127.0.0.1). The viewer binds loopback only, accepts only Host 127.0.0.1:&lt;port&gt; or localhost:&lt;port&gt;, sends strict CSP and nosniff headers, has no CORS, and returns 405 for every method other than GET and HEAD.</p>
         </li>
         <li class="specimen__item">
           <p class="specimen__term">approval</p>
