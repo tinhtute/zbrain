@@ -80,8 +80,9 @@ impl Server {
             match listener.accept() {
                 Ok((stream, _)) => {
                     let paths = self.paths.clone();
+                    let port = self.port;
                     std::thread::spawn(move || {
-                        let _ = handle_connection(stream, &paths);
+                        let _ = handle_connection(stream, &paths, port);
                     });
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
@@ -98,7 +99,7 @@ impl Server {
     }
 }
 
-fn handle_connection(mut stream: TcpStream, paths: &Paths) -> std::io::Result<()> {
+fn handle_connection(mut stream: TcpStream, paths: &Paths, port: u16) -> std::io::Result<()> {
     // Accepted streams inherit the listener's non-blocking mode; the handler
     // below is written as blocking I/O, so restore blocking mode first.
     // Without this, a read racing the client's write returns WouldBlock and
@@ -119,16 +120,46 @@ fn handle_connection(mut stream: TcpStream, paths: &Paths) -> std::io::Result<()
             break;
         }
     }
-    let response = route_request(&buf, paths);
+    let response = route_request(&buf, paths, port);
     stream.write_all(&response)?;
     stream.flush()?;
     Ok(())
 }
 
-fn route_request(raw: &[u8], paths: &Paths) -> Vec<u8> {
+/// Accepts only `127.0.0.1:<port>` or `localhost:<port>` (host part
+/// case-insensitive) so a DNS-rebound page cannot read from the viewer.
+fn host_allowed(value: &str, port: u16) -> bool {
+    let Some((host, host_port)) = value.trim().rsplit_once(':') else {
+        return false;
+    };
+    (host.eq_ignore_ascii_case("127.0.0.1") || host.eq_ignore_ascii_case("localhost"))
+        && host_port == port.to_string()
+}
+
+fn route_request(raw: &[u8], paths: &Paths, port: u16) -> Vec<u8> {
     let text = String::from_utf8_lossy(raw);
     let mut lines = text.split("\r\n");
     let request_line = lines.next().unwrap_or("");
+    let hosts: Vec<&str> = lines
+        .by_ref()
+        .take_while(|line| !line.is_empty())
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(name, _)| name.trim().eq_ignore_ascii_case("host"))
+        .map(|(_, value)| value)
+        .collect();
+    match hosts.as_slice() {
+        [] => return http_response(400, "Bad Request", "text/plain; charset=utf-8", b"", "GET"),
+        [one] if host_allowed(one, port) => {}
+        _ => {
+            return http_response(
+                421,
+                "Misdirected Request",
+                "text/plain; charset=utf-8",
+                b"",
+                "GET",
+            )
+        }
+    }
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("");
@@ -915,7 +946,11 @@ mod tests {
         let body = render_page(&paths).unwrap();
         let text = String::from_utf8(body).unwrap();
         assert!(text.contains("zbrain"));
-        let response = route_request(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n", &paths);
+        let response = route_request(
+            b"GET / HTTP/1.1\r\nHost: 127.0.0.1:4000\r\n\r\n",
+            &paths,
+            4000,
+        );
         let text = String::from_utf8(response).unwrap();
         assert!(text.starts_with("HTTP/1.1 200 OK"));
         assert!(text.contains(
@@ -931,8 +966,8 @@ mod tests {
         for method in [
             "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "TRACE", "CONNECT", "BREW",
         ] {
-            let raw = format!("{method} / HTTP/1.1\r\nHost: x\r\n\r\n");
-            let response = route_request(raw.as_bytes(), &paths);
+            let raw = format!("{method} / HTTP/1.1\r\nHost: localhost:4000\r\n\r\n");
+            let response = route_request(raw.as_bytes(), &paths, 4000);
             let text = String::from_utf8(response).unwrap();
             assert!(text.starts_with("HTTP/1.1 405"), "{method}: {text}");
             assert!(text.contains("Content-Security-Policy:"), "{method}");
@@ -943,8 +978,8 @@ mod tests {
     fn unknown_paths_are_404() {
         let (_dir, paths) = test_paths("404");
         for path in ["/missing.html", "/index.html", "/embed.go"] {
-            let raw = format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n");
-            let response = route_request(raw.as_bytes(), &paths);
+            let raw = format!("GET {path} HTTP/1.1\r\nHost: localhost:4000\r\n\r\n");
+            let response = route_request(raw.as_bytes(), &paths, 4000);
             assert!(
                 String::from_utf8(response)
                     .unwrap()
@@ -961,8 +996,8 @@ mod tests {
             ("/style.css", "text/css; charset=utf-8"),
             ("/app.js", "text/javascript; charset=utf-8"),
         ] {
-            let raw = format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n");
-            let response = route_request(raw.as_bytes(), &paths);
+            let raw = format!("GET {path} HTTP/1.1\r\nHost: localhost:4000\r\n\r\n");
+            let response = route_request(raw.as_bytes(), &paths, 4000);
             let text = String::from_utf8(response).unwrap();
             assert!(text.starts_with("HTTP/1.1 200"), "{path}: {text}");
             assert!(
@@ -1052,8 +1087,8 @@ mod tests {
             "/api/claims",
             "/api/claim/clm_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         ] {
-            let raw = format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n");
-            let response = route_request(raw.as_bytes(), &paths);
+            let raw = format!("GET {path} HTTP/1.1\r\nHost: localhost:4000\r\n\r\n");
+            let response = route_request(raw.as_bytes(), &paths, 4000);
             let text = String::from_utf8(response).unwrap();
             assert!(text.starts_with("HTTP/1.1 200"), "{path}: {text}");
             let body = text.split("\r\n\r\n").nth(1).unwrap_or("");
@@ -1062,8 +1097,8 @@ mod tests {
                 "{path}: {body}"
             );
         }
-        let raw = "GET /api/workspace HTTP/1.1\r\nHost: x\r\n\r\n";
-        let response = String::from_utf8(route_request(raw.as_bytes(), &paths)).unwrap();
+        let raw = "GET /api/workspace HTTP/1.1\r\nHost: localhost:4000\r\n\r\n";
+        let response = String::from_utf8(route_request(raw.as_bytes(), &paths, 4000)).unwrap();
         let body = response.split("\r\n\r\n").nth(1).unwrap_or("");
         let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
         assert_eq!(parsed["workspace"], "research");
@@ -1072,8 +1107,8 @@ mod tests {
     #[test]
     fn head_returns_headers_without_body() {
         let (_dir, paths) = test_paths("head");
-        let raw = "HEAD / HTTP/1.1\r\nHost: x\r\n\r\n";
-        let response = route_request(raw.as_bytes(), &paths);
+        let raw = "HEAD / HTTP/1.1\r\nHost: localhost:4000\r\n\r\n";
+        let response = route_request(raw.as_bytes(), &paths, 4000);
         let text = String::from_utf8(response).unwrap();
         assert!(text.starts_with("HTTP/1.1 200"), "{text}");
         let body = text.split("\r\n\r\n").nth(1).unwrap_or("MISSING");
@@ -1114,6 +1149,8 @@ mod tests {
     #[test]
     fn host_header_must_be_loopback_with_bound_port() {
         let (_dir, paths) = test_paths("host");
+        let now = FixedClock::new(Utc.with_ymd_and_hms(2026, 7, 30, 9, 0, 0).unwrap());
+        crate::workspace::create_workspace(&paths, "research", &now).unwrap();
         let mut server = Server::new(paths);
         let url = server.listen().unwrap();
         let port: u16 = url.rsplit(':').next().unwrap().parse().unwrap();
