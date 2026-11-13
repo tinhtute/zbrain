@@ -255,11 +255,13 @@ impl App {
         let workspace = self.resolve_workspace(parsed.single("workspace"))?;
         let mut findings: Vec<String> = Vec::new();
         let mut freshness_failed = false;
-        let mut wiki_markdown_failed = false;
+        // Some(other_invalid) when non-claim wiki Markdown blocks the index.
+        let mut wiki_markdown: Option<i64> = None;
         if let Err(err) = IndexStore::new(self.paths.clone()).check_fresh(&workspace) {
-            let err = err.to_string();
-            wiki_markdown_failed = err.contains(crate::claims::WIKI_MARKDOWN_FIX);
-            findings.push(err);
+            if let crate::index::IndexError::WikiMarkdown { other_invalid, .. } = &err {
+                wiki_markdown = Some(*other_invalid);
+            }
+            findings.push(err.to_string());
             freshness_failed = true;
         }
         let structural = crate::lint::structural_findings(&self.paths, &workspace)
@@ -313,8 +315,12 @@ impl App {
             "degraded"
         };
         let mut next_action = "zbrain reindex";
-        if wiki_markdown_failed {
-            next_action = "move non-claim files out of wiki/, then zbrain reindex";
+        if let Some(other_invalid) = wiki_markdown {
+            next_action = if other_invalid == 0 {
+                "move non-claim files out of wiki/, then zbrain reindex"
+            } else {
+                "move non-claim files out of wiki/, fix the other invalid trust inputs zbrain reindex lists, then zbrain reindex"
+            };
         } else if !freshness_failed && !structural.is_empty() {
             next_action = "review structural findings";
         }
