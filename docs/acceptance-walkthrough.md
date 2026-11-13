@@ -151,7 +151,9 @@ serves embedded HTML/CSS/JS, and escapes Markdown and raw evidence before
 rendering. Check responses for the strict CSP
 `default-src 'self'; script-src 'none'; object-src 'none'`,
 `X-Content-Type-Options: nosniff`, and no `Access-Control-*` headers. Every method other than `GET` and `HEAD` receives `405 Method Not Allowed`;
-the viewer has no mutation API.
+the viewer has no mutation API. Only `Host: 127.0.0.1:<port>` or
+`localhost:<port>` is accepted: a missing `Host` returns `400` and any other
+or repeated `Host` returns `421` with an empty body.
 
 ## Verification gates
 
