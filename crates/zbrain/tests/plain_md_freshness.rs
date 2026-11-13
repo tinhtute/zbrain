@@ -195,3 +195,62 @@ fn plain_note_at_wiki_root_is_named_before_reindex() {
 fn plain_note_inside_claim_tier_is_named_before_reindex() {
     plain_note_bricks_with_actionable_error("tier", "projects/todo.md");
 }
+
+/// A rejected index with a non-claim wiki file AND an invalid claim must
+/// not present moving the file as the whole fix (audit item 9 follow-up).
+#[test]
+fn plain_note_does_not_hide_other_invalid_claims() {
+    let fx = indexed_workspace("mixed");
+    let wiki = fx.paths.workspaces_dir.join("research/wiki");
+    std::fs::write(wiki.join("todo.md"), "# scratch\nunrelated note\n").unwrap();
+    // A tampered copy of the approved claim: its digest no longer matches.
+    let bad_id = "clm_0000000000000000000000000000000a";
+    let original = std::fs::read_to_string(wiki.join(format!("projects/{CLAIM_ID}.md"))).unwrap();
+    let tampered = original
+        .replace(CLAIM_ID, bad_id)
+        .replace("tuesday", "friday");
+    std::fs::write(wiki.join(format!("projects/{bad_id}.md")), tampered).unwrap();
+
+    let (_, reindex) = zbrain(&fx, &["reindex", "--workspace", "research"]);
+    assert!(
+        reindex.contains("\"rebuild_state\": \"rejected\""),
+        "{reindex}"
+    );
+    assert!(
+        reindex.contains(bad_id),
+        "reindex must list the bad claim:\n{reindex}"
+    );
+
+    let (ok, after) = ask(&fx);
+    assert!(!ok, "ask must fail closed:\n{after}");
+    assert_actionable("ask", &after, "todo.md");
+    assert!(
+        after.contains("1 other invalid trust input"),
+        "ask must report the other invalid cause:\n{after}"
+    );
+
+    let (_, doctor) = zbrain(&fx, &["doctor", "--workspace", "research"]);
+    assert_actionable("doctor", &doctor, "todo.md");
+    assert!(
+        doctor.contains("1 other invalid trust input"),
+        "doctor must report the other invalid cause:\n{doctor}"
+    );
+    assert!(
+        !doctor.contains(
+            "\"next_action\": \"move non-claim files out of wiki/, then zbrain reindex\""
+        ),
+        "doctor must not present moving the file as the whole fix:\n{doctor}"
+    );
+    assert!(
+        doctor.contains("\"next_action\": \"move non-claim files out of wiki/, fix the other invalid trust inputs zbrain reindex lists, then zbrain reindex\""),
+        "doctor next_action must name both fixes:\n{doctor}"
+    );
+
+    // Moving the note alone leaves the index rejected by the bad claim.
+    std::fs::rename(wiki.join("todo.md"), fx.dir.join("todo.md")).unwrap();
+    let (_, reindex) = zbrain(&fx, &["reindex", "--workspace", "research"]);
+    assert!(
+        reindex.contains("\"rebuild_state\": \"rejected\""),
+        "{reindex}"
+    );
+}

@@ -35,6 +35,15 @@ pub enum IndexError {
     Rusqlite(rusqlite::Error),
     Claim(ClaimError),
     Message(String),
+    /// Markdown under `wiki/` that is not a claim in a wiki tier makes the
+    /// rebuild reject the index, and `reindex` alone cannot clear it.
+    /// `files` are wiki-relative paths; `other_invalid` counts the other
+    /// trust inputs the last rebuild rejected (0 before a rebuild saw them).
+    WikiMarkdown {
+        message: String,
+        files: Vec<String>,
+        other_invalid: i64,
+    },
 }
 
 impl std::fmt::Display for IndexError {
@@ -45,6 +54,7 @@ impl std::fmt::Display for IndexError {
             Self::Rusqlite(source) => write!(f, "{source}"),
             Self::Claim(source) => write!(f, "{source}"),
             Self::Message(message) => write!(f, "{message}"),
+            Self::WikiMarkdown { message, .. } => write!(f, "{message}"),
         }
     }
 }
@@ -328,11 +338,18 @@ impl IndexStore {
                 non_claims.sort();
                 non_claims.dedup();
                 if !non_claims.is_empty() {
-                    return msg(wiki_markdown_message(
+                    // Each listed file is one rejected input; the rest of
+                    // the recorded count are other causes the move won't fix.
+                    let other_invalid = state
+                        .invalid_count
+                        .saturating_sub(non_claims.len() as i64)
+                        .max(0);
+                    return Err(wiki_markdown_error(
                         workspace,
                         &workspace_root,
                         "rejected",
-                        &non_claims,
+                        non_claims,
+                        other_invalid,
                     ));
                 }
             }
@@ -356,11 +373,12 @@ impl IndexStore {
                 ))
             })?;
         if !outside_tiers.is_empty() {
-            return msg(wiki_markdown_message(
+            return Err(wiki_markdown_error(
                 workspace,
                 &workspace_root,
                 "stale",
-                &outside_tiers,
+                outside_tiers,
+                0,
             ));
         }
         let generation = read_workspace_generation(&self.paths, workspace).map_err(|err| {
@@ -437,7 +455,7 @@ impl IndexStore {
                 ))
             })?;
             if let Some(offender) = offender {
-                return msg(stale_input_message(workspace, &workspace_root, &offender));
+                return Err(stale_input_error(workspace, &workspace_root, &offender));
             }
         }
         let mut change_token_unavailable = false;
@@ -460,7 +478,7 @@ impl IndexStore {
                         "workspace {workspace:?} index manifest is stale; run zbrain reindex"
                     ));
                 };
-                return msg(stale_input_message(
+                return Err(stale_input_error(
                     workspace,
                     &workspace_root,
                     &workspace_root.join(slash_parts(&offender)),
@@ -506,7 +524,7 @@ impl IndexStore {
             if info.mtime_nsec_composed() != recorded_metadata.modified_at
                 || file_change_token(&info) != recorded_metadata.change_token
             {
-                return msg(stale_input_message(workspace, &workspace_root, &input_path));
+                return Err(stale_input_error(workspace, &workspace_root, &input_path));
             }
         }
         Ok(manifest)
@@ -972,48 +990,64 @@ pub(crate) fn read_trust_directories(
     Ok(directories)
 }
 
-/// Failure text for wiki Markdown files the rebuild rejects. It names the
+/// Failure for wiki Markdown files the rebuild rejects. The text names the
 /// first file and the fix, because `reindex` alone leaves the index
-/// rejected. `condition` is "stale" before a rebuild saw the files and
-/// "rejected" after.
-fn wiki_markdown_message(
+/// rejected, and counts `other_invalid` inputs so the move is not presented
+/// as the whole fix. `condition` is "stale" before a rebuild saw the files
+/// and "rejected" after.
+fn wiki_markdown_error(
     workspace: &str,
     workspace_root: &Path,
     condition: &str,
-    wiki_relative: &[String],
-) -> String {
+    files: Vec<String>,
+    other_invalid: i64,
+) -> IndexError {
     let first = workspace_root
         .join("wiki")
-        .join(slash_parts(&wiki_relative[0].replace('\\', "/")));
-    let more = match wiki_relative.len() {
+        .join(slash_parts(&files[0].replace('\\', "/")));
+    let more = match files.len() {
         1 => String::new(),
         count => format!(" (and {} more)", count - 1),
     };
-    format!(
-        "workspace {workspace:?} index is {condition}; wiki file {:?}{more} is not a zbrain claim in a wiki tier; {}",
+    let others = match other_invalid {
+        0 => String::new(),
+        1 => "; 1 other invalid trust input also blocks the index; zbrain reindex lists it"
+            .to_string(),
+        count => format!(
+            "; {count} other invalid trust inputs also block the index; zbrain reindex lists them"
+        ),
+    };
+    let message = format!(
+        "workspace {workspace:?} index is {condition}; wiki file {:?}{more} is not a zbrain claim in a wiki tier; {}{others}",
         first.display(),
         claims::WIKI_MARKDOWN_FIX
-    )
+    );
+    IndexError::WikiMarkdown {
+        message,
+        files,
+        other_invalid,
+    }
 }
 
 /// Failure text for a trust input that changed after the index. A non-claim
 /// Markdown file gets the actionable message instead of "run zbrain reindex",
 /// which would only publish a rejected index.
-fn stale_input_message(workspace: &str, workspace_root: &Path, input: &Path) -> String {
+fn stale_input_error(workspace: &str, workspace_root: &Path, input: &Path) -> IndexError {
     if claims::is_non_claim_markdown_file(input) {
         if let Ok(relative) = input.strip_prefix(workspace_root.join("wiki")) {
-            return wiki_markdown_message(
+            return wiki_markdown_error(
                 workspace,
                 workspace_root,
                 "stale",
-                &[relative.to_string_lossy().to_string()],
+                vec![relative.to_string_lossy().to_string()],
+                0,
             );
         }
     }
-    format!(
+    IndexError::Message(format!(
         "workspace {workspace:?} index is stale; trust input {:?} changed after index; run zbrain reindex",
         input.display()
-    )
+    ))
 }
 
 fn find_freshness_offender(
