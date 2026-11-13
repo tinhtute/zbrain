@@ -52,6 +52,16 @@ fn store_at(paths: &Paths, at: DateTime<Utc>) -> ClaimStore {
 /// Writes a draft with the given `stale_after` and approves it through the
 /// normal signed approval path.
 fn approved_claim(paths: &Paths, id: &str, body: &str, stale_after: &str) {
+    approved_claim_with_conflicts(paths, id, body, stale_after, Vec::new());
+}
+
+fn approved_claim_with_conflicts(
+    paths: &Paths,
+    id: &str,
+    body: &str,
+    stale_after: &str,
+    conflicts_with: Vec<String>,
+) {
     let at = Utc.with_ymd_and_hms(2026, 8, 5, 10, 0, 0).unwrap();
     let claim = Claim {
         claim_type: OKF_CLAIM_TYPE.into(),
@@ -63,6 +73,7 @@ fn approved_claim(paths: &Paths, id: &str, body: &str, stale_after: &str) {
         created_at: rfc3339(at),
         created_by: "owner".into(),
         stale_after: stale_after.into(),
+        conflicts_with,
         body: body.into(),
         ..Claim::default()
     };
@@ -184,5 +195,36 @@ fn as_of_ask_staleness_unchanged() {
     // At or after stale_after it is not.
     let after = ask(&paths, "oncall rotation", "2026-09-01T00:00:00Z");
     assert_eq!(after.status, QUERY_STATUS_GAP);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn plain_ask_stale_conflict_target_does_not_block() {
+    // Same rule as `--as-of now`: a stale approved claim is not trusted, so a
+    // fresh claim's declared conflict with it does not block the answer.
+    let (dir, paths) = stale_paths("plain-conflict");
+    approved_claim(
+        &paths,
+        STALE_ID,
+        "pager escalation alice\n",
+        "2020-01-01T00:00:00Z",
+    );
+    approved_claim_with_conflicts(
+        &paths,
+        FRESH_ID,
+        "oncall rotation bob\n",
+        "2099-01-01T00:00:00Z",
+        vec![STALE_ID.to_string()],
+    );
+    rebuild(&paths);
+
+    let response = ask(&paths, "oncall rotation", "");
+    assert_eq!(
+        response.status, QUERY_STATUS_READY,
+        "conflicts={:?}",
+        response.conflicts
+    );
+    assert!(response.conflicts.is_empty());
+    assert_eq!(claim_ids(&response), vec![FRESH_ID.to_string()]);
     let _ = std::fs::remove_dir_all(&dir);
 }
