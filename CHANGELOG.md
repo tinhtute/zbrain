@@ -52,6 +52,24 @@
   passes it, and owner proof is the planned signed-approval work. `make smoke`
   and the audit repros drive the real ceremony through
   `scripts/owner-approve.py`.
+- Plain `ask` (and MCP `memory_ask`) now applies `stale_after` the same way
+  `ask --as-of now` does: an approved claim at or past its `stale_after` is
+  not trusted, so the answer is `gap` instead of `ready`. A stale approved
+  claim no longer takes part in conflict blocking in either direction: one
+  named in another claim's `conflicts_with` does not block it, and its own
+  `conflicts_with` blocks nothing, matching `--as-of now`
+  (`trusted-memory-spec.md` §9). `doctor` uses the same boundary (stale at or after
+  `stale_after`).
+- A non-claim `.md` anywhere under `wiki/` (outside the tier folders, or a
+  non-claim file inside one) now makes the index stale before reindex instead
+  of silently passing freshness and bricking `ask` after the next reindex.
+  `ask`, `reindex`, and `doctor` name the file and the fix (move it out of
+  `wiki/` or make it a valid claim), and `doctor`'s `next_action` says so.
+  `reindex` and MCP `memory_reindex` add `legacy_files: [{path, error}]`,
+  omitted when empty.
+- The viewer accepts only `Host: 127.0.0.1:<port>` or `localhost:<port>` for
+  its bound port, closing DNS-rebinding reads. A missing `Host` gets 400; any
+  other host, port, or a repeated `Host` gets 421 with an empty body.
 
 ## 0.4.0 (2026-09-06) — Rust cutover
 

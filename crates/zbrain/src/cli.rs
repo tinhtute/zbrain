@@ -255,8 +255,11 @@ impl App {
         let workspace = self.resolve_workspace(parsed.single("workspace"))?;
         let mut findings: Vec<String> = Vec::new();
         let mut freshness_failed = false;
+        let mut wiki_markdown_failed = false;
         if let Err(err) = IndexStore::new(self.paths.clone()).check_fresh(&workspace) {
-            findings.push(err.to_string());
+            let err = err.to_string();
+            wiki_markdown_failed = err.contains(crate::claims::WIKI_MARKDOWN_FIX);
+            findings.push(err);
             freshness_failed = true;
         }
         let structural = crate::lint::structural_findings(&self.paths, &workspace)
@@ -310,7 +313,9 @@ impl App {
             "degraded"
         };
         let mut next_action = "zbrain reindex";
-        if !freshness_failed && !structural.is_empty() {
+        if wiki_markdown_failed {
+            next_action = "move non-claim files out of wiki/, then zbrain reindex";
+        } else if !freshness_failed && !structural.is_empty() {
             next_action = "review structural findings";
         }
         #[derive(Serialize)]

@@ -228,3 +228,34 @@ fn plain_ask_stale_conflict_target_does_not_block() {
     assert_eq!(claim_ids(&response), vec![FRESH_ID.to_string()]);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn plain_ask_stale_claim_declaring_conflict_does_not_block() {
+    // Reverse direction: the stale claim declares the conflict. It is not
+    // trusted, so its declaration blocks nothing.
+    let (dir, paths) = stale_paths("plain-conflict-reverse");
+    approved_claim_with_conflicts(
+        &paths,
+        STALE_ID,
+        "oncall rotation alice\n",
+        "2020-01-01T00:00:00Z",
+        vec![FRESH_ID.to_string()],
+    );
+    approved_claim(
+        &paths,
+        FRESH_ID,
+        "oncall rotation bob\n",
+        "2099-01-01T00:00:00Z",
+    );
+    rebuild(&paths);
+
+    let response = ask(&paths, "oncall rotation", "");
+    assert_eq!(
+        response.status, QUERY_STATUS_READY,
+        "conflicts={:?}",
+        response.conflicts
+    );
+    assert!(response.conflicts.is_empty());
+    assert_eq!(claim_ids(&response), vec![FRESH_ID.to_string()]);
+    let _ = std::fs::remove_dir_all(&dir);
+}

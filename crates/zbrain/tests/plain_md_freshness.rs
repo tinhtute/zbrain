@@ -146,6 +146,16 @@ fn plain_note_bricks_with_actionable_error(name: &str, wiki_relative: &str) {
     );
     assert_actionable("ask before reindex", &before_reindex, wiki_relative);
 
+    // doctor must point at the real fix, not at a reindex that cannot clear it.
+    let (_, doctor) = zbrain(&fx, &["doctor", "--workspace", "research"]);
+    assert_actionable("doctor", &doctor, wiki_relative);
+    assert!(
+        doctor.contains(
+            "\"next_action\": \"move non-claim files out of wiki/, then zbrain reindex\""
+        ),
+        "doctor next_action must name the wiki fix:\n{doctor}"
+    );
+
     let (_, reindex) = zbrain(&fx, &["reindex", "--workspace", "research"]);
     assert!(
         reindex.contains("\"rebuild_state\": \"rejected\""),

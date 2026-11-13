@@ -71,7 +71,8 @@ pub fn structural_findings_at(
         }
         if claim.status == CLAIM_STATUS_APPROVED && !claim.stale_after.is_empty() {
             if let Ok(stale_after) = crate::clock::parse_rfc3339(&claim.stale_after) {
-                if stale_after < now {
+                // Same boundary as `ask`: stale at or after `stale_after`.
+                if stale_after <= now {
                     findings.push(format!(
                         "claim {} stale_after {} is in the past",
                         claim.id, claim.stale_after
@@ -340,6 +341,14 @@ mod tests {
                 "claim {} stale_after 2020-01-01T00:00:00Z is in the past",
                 draft.id
             )),
+            "{findings:?}"
+        );
+        // Boundary: `ask` treats a claim as stale at the exact instant, so
+        // doctor must flag it at that instant too.
+        let at_boundary = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let findings = structural_findings_at(&paths, "research", at_boundary).unwrap();
+        assert!(
+            findings.iter().any(|f| f.contains("stale_after")),
             "{findings:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);

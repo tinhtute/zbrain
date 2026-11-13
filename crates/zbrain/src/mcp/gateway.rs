@@ -1731,6 +1731,18 @@ fn summary_output_json(schema_version: i64, summary: &IndexSummary) -> OrderedJs
         ));
     }
     entries.push(("legacy", OrderedJson::Int(summary.legacy)));
+    if !summary.legacy_files.is_empty() {
+        entries.push((
+            "legacy_files",
+            OrderedJson::Array(
+                summary
+                    .legacy_files
+                    .iter()
+                    .map(invalid_claim_entry)
+                    .collect(),
+            ),
+        ));
+    }
     entries.push(("rebuild_state", OrderedJson::string(&summary.rebuild_state)));
     entries.push((
         "manifest_digest",
@@ -2360,6 +2372,26 @@ fn claim_transition_authorization_json(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn summary_output_reports_legacy_files_like_the_cli() {
+        use super::*;
+        let summary = IndexSummary {
+            legacy: 1,
+            legacy_files: vec![InvalidClaimSerde {
+                path: "notes/todo.md".into(),
+                error: "not a zbrain claim".into(),
+            }],
+            ..IndexSummary::default()
+        };
+        let mcp = super::summary_output_json(1, &summary).compact();
+        let mcp: serde_json::Value = serde_json::from_str(&mcp).unwrap();
+        let cli = serde_json::to_value(&summary).unwrap();
+        assert_eq!(mcp["legacy_files"], cli["legacy_files"], "{mcp}");
+
+        let empty = super::summary_output_json(1, &IndexSummary::default()).compact();
+        assert!(!empty.contains("legacy_files"), "{empty}");
+    }
+
     use super::*;
     use crate::claims::{new_claim_id, CLAIM_BASIS_EVIDENCE, OKF_CLAIM_TYPE};
     use crate::clock::{rfc3339, FixedClock};

@@ -305,6 +305,14 @@ references, citation spans, and relevance metadata. The query schema is version
 raw evidence, invalid claims, or conflicts into trusted context merely to avoid
 a gap.
 
+An approved claim is trusted only before its `stale_after` instant: at or past
+it, plain `ask`, `ask --as-of`, MCP `memory_ask`, and `doctor` treat it as
+stale. A stale claim is not trusted context, so it is neither returned nor
+counted as a conflict, in either direction: a current claim that declares
+`conflicts_with` a stale claim is not blocked by it, and a stale claim's own
+`conflicts_with` blocks nothing. `stale_after` is covered by the verification
+digest, so only time, never a file edit, can expire a claim.
+
 ## 10. Design Rules
 
 1. Markdown and immutable evidence are the source of truth.
