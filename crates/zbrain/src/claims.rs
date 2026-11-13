@@ -1543,6 +1543,75 @@ fn is_zbrain_claim_document(contents: &[u8]) -> bool {
     probe.schema == CLAIM_SCHEMA_VERSION || probe.claim_type == OKF_CLAIM_TYPE
 }
 
+/// The fix for a wiki Markdown file the index rebuild rejects: `reindex`
+/// alone cannot clear it.
+pub const WIKI_MARKDOWN_FIX: &str =
+    "move it out of wiki/ or make it a valid claim in a wiki tier, then run zbrain reindex";
+
+/// Whether the regular file at `path` is Markdown that is not a zbrain claim
+/// document, which the rebuild adds to `legacy_unindexed`. Unreadable or
+/// non-regular paths report false so callers keep their own message.
+pub(crate) fn is_non_claim_markdown_file(path: &Path) -> bool {
+    if path.extension().is_none_or(|ext| ext != "md") {
+        return false;
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(info) if info.is_file() => {}
+        _ => return false,
+    }
+    match std::fs::read(path) {
+        Ok(contents) => !is_zbrain_claim_document(&contents),
+        Err(_) => false,
+    }
+}
+
+/// Wiki-relative paths of `.md` files under `wiki_root` that sit outside the
+/// known tiers. The rebuild scans all of `wiki/` and rejects every one of
+/// them (a non-claim file is legacy, a claim file has an unsupported tier),
+/// so freshness must see them too. Only the top level of `wiki/` and
+/// non-tier directories are listed; tier contents are never walked here.
+pub(crate) fn wiki_markdown_outside_tiers(wiki_root: &Path) -> Result<Vec<String>, ClaimError> {
+    let mut children: Vec<PathBuf> = std::fs::read_dir(wiki_root)?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .collect();
+    children.sort();
+    let mut files = Vec::new();
+    for child in children {
+        let info = std::fs::symlink_metadata(&child)?;
+        if info.is_dir() {
+            let name = child.file_name().unwrap_or_default().to_string_lossy();
+            if is_known_wiki_tier(&name) {
+                continue;
+            }
+            visit_markdown(wiki_root, &child, &mut files)?;
+            continue;
+        }
+        if child.extension().is_some_and(|ext| ext == "md") {
+            let rel = child
+                .strip_prefix(wiki_root)
+                .map_err(message)?
+                .to_string_lossy()
+                .to_string();
+            files.push((child.clone(), rel));
+        }
+    }
+    Ok(files.into_iter().map(|(_, rel)| rel).collect())
+}
+
+/// Wiki-relative paths of every non-claim `.md` file under `wiki_root`, in
+/// rebuild order. It reads every Markdown file, so callers use it only on a
+/// failure path.
+pub(crate) fn wiki_non_claim_markdown(wiki_root: &Path) -> Result<Vec<String>, ClaimError> {
+    let mut paths = Vec::new();
+    for (path, rel) in walk_markdown_files(wiki_root)? {
+        if is_non_claim_markdown_file(&path) {
+            paths.push(rel);
+        }
+    }
+    Ok(paths)
+}
+
 impl ClaimStore {
     pub fn new(paths: Paths) -> Self {
         Self { paths, now: None }
