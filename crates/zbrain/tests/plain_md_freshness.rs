@@ -267,3 +267,59 @@ fn plain_note_does_not_hide_other_invalid_claims() {
         "{reindex}"
     );
 }
+
+/// The other-invalid count describes the wiki as it is now, not as the last
+/// rejected rebuild saw it.
+#[test]
+fn other_invalid_count_follows_wiki_changes_after_a_rejected_rebuild() {
+    // Over-report: two notes, rebuild, one note moved out. Nothing else is
+    // invalid, so no other input may be reported.
+    let fx = indexed_workspace("recount-over");
+    let wiki = fx.paths.workspaces_dir.join("research/wiki");
+    std::fs::write(wiki.join("a.md"), "# a\nnote\n").unwrap();
+    std::fs::write(wiki.join("b.md"), "# b\nnote\n").unwrap();
+    let (_, reindex) = zbrain(&fx, &["reindex", "--workspace", "research"]);
+    assert!(
+        reindex.contains("\"rebuild_state\": \"rejected\""),
+        "{reindex}"
+    );
+    std::fs::rename(wiki.join("b.md"), fx.dir.join("b.md")).unwrap();
+    let (ok, after) = ask(&fx);
+    assert!(!ok, "ask must fail closed:\n{after}");
+    assert_actionable("ask", &after, "a.md");
+    assert!(
+        !after.contains("other invalid"),
+        "a removed note must not count as another invalid input:\n{after}"
+    );
+    let (_, doctor) = zbrain(&fx, &["doctor", "--workspace", "research"]);
+    assert!(
+        doctor.contains(
+            "\"next_action\": \"move non-claim files out of wiki/, then zbrain reindex\""
+        ),
+        "{doctor}"
+    );
+
+    // Under-report: a note and a bad claim, rebuild, a second note added.
+    // The bad claim must still be reported.
+    let fx = indexed_workspace("recount-under");
+    let wiki = fx.paths.workspaces_dir.join("research/wiki");
+    std::fs::write(wiki.join("a.md"), "# a\nnote\n").unwrap();
+    let bad_id = "clm_0000000000000000000000000000000a";
+    let original = std::fs::read_to_string(wiki.join(format!("projects/{CLAIM_ID}.md"))).unwrap();
+    let tampered = original
+        .replace(CLAIM_ID, bad_id)
+        .replace("tuesday", "friday");
+    std::fs::write(wiki.join(format!("projects/{bad_id}.md")), tampered).unwrap();
+    let (_, reindex) = zbrain(&fx, &["reindex", "--workspace", "research"]);
+    assert!(
+        reindex.contains("\"rebuild_state\": \"rejected\""),
+        "{reindex}"
+    );
+    std::fs::write(wiki.join("b.md"), "# b\nnote\n").unwrap();
+    let (ok, after) = ask(&fx);
+    assert!(!ok, "ask must fail closed:\n{after}");
+    assert!(
+        after.contains("1 other invalid trust input"),
+        "an added note must not hide the bad claim:\n{after}"
+    );
+}

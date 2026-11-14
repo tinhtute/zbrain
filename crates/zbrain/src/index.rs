@@ -291,6 +291,17 @@ impl IndexStore {
         self.check_fresh_unlocked_output(workspace)
     }
 
+    /// The number of trust inputs a rebuild would reject right now, counted
+    /// the way `rebuild` counts them. `None` when the scan itself fails.
+    fn current_invalid_count(&self, workspace: &str) -> Option<i64> {
+        let store = ClaimStore::new(self.paths.clone());
+        let scan = store.scan_workspace_inner(workspace, false).ok()?;
+        let (_, dependency_invalid) = store
+            .validate_trusted_claims(workspace, &scan.claims)
+            .ok()?;
+        Some((scan.invalid.len() + dependency_invalid.len() + scan.legacy_unindexed.len()) as i64)
+    }
+
     /// checkFreshUnlockedOutput validates freshness and returns the published
     /// trust-input manifest read from the index.
     pub(crate) fn check_fresh_unlocked_output(
@@ -338,12 +349,14 @@ impl IndexStore {
                 non_claims.sort();
                 non_claims.dedup();
                 if !non_claims.is_empty() {
-                    // Each listed file is one rejected input; the rest of
-                    // the recorded count are other causes the move won't fix.
-                    let other_invalid = state
-                        .invalid_count
-                        .saturating_sub(non_claims.len() as i64)
-                        .max(0);
+                    // Each listed file is one rejected input; the rest are
+                    // other causes the move won't fix. Count them on the
+                    // wiki as it is now: the recorded count describes the
+                    // last rebuild and drifts once files are added or moved.
+                    let invalid_now = self
+                        .current_invalid_count(workspace)
+                        .unwrap_or(state.invalid_count);
+                    let other_invalid = invalid_now.saturating_sub(non_claims.len() as i64).max(0);
                     return Err(wiki_markdown_error(
                         workspace,
                         &workspace_root,

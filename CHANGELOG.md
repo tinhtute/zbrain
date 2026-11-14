@@ -74,8 +74,9 @@
 - When a rejected index has both a non-claim wiki file and other invalid trust
   inputs, the error now says so ("N other invalid trust inputs also block the
   index; zbrain reindex lists them") and `doctor`'s `next_action` names both
-  fixes, so moving the file is not presented as the whole fix. The count comes
-  from the last rebuild, so it can lag wiki files added or removed since.
+  fixes, so moving the file is not presented as the whole fix. The count is
+  taken from the wiki as it is now, so it stays right when files are added or
+  moved after the rejected rebuild.
 
 ## 0.4.0 (2026-09-06) — Rust cutover
 
