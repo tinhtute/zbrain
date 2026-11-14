@@ -59,6 +59,46 @@ impl LoopbackEmbedder {
     }
 }
 
+/// embedding_text is the exact text a claim's vector is built from. The
+/// readiness gate in query.rs compares a query against the same composition,
+/// so both callers must keep using this one function.
+pub(crate) fn embedding_text(title: &str, description: &str, tags: &str, body: &str) -> String {
+    format!("{title} {description} {tags} {body}")
+}
+
+/// Function words carry no retrieval evidence: a vector that overlaps the query
+/// only on "the" or "is" is not related to it.
+const STOPWORDS: &[&str] = &[
+    "and", "are", "but", "can", "could", "did", "does", "for", "from", "had", "has", "have", "her",
+    "here", "him", "his", "how", "its", "not", "our", "out", "she", "should", "than", "that",
+    "the", "their", "them", "then", "there", "these", "they", "this", "those", "too", "was",
+    "were", "what", "when", "where", "which", "who", "why", "will", "with", "would", "you", "your",
+];
+
+fn is_significant_token(token: &str) -> bool {
+    token.len() > 2 && !STOPWORDS.contains(&token)
+}
+
+/// shares_meaningful_token reports whether query and text share at least one
+/// token that carries retrieval evidence, using the embedder's own tokenizer.
+///
+/// This is the collision-free form of "the vector is related": loopback-v1 is a
+/// hashed bag-of-words, so its cosine cannot separate a genuinely shared token
+/// (median 0.12) from a hash collision on unrelated text (up to 0.28). The gate
+/// is therefore decided on tokens, not on the score.
+pub(crate) fn shares_meaningful_token(query: &str, text: &str) -> bool {
+    let text_tokens: HashSet<String> = loopback_tokens(text)
+        .into_iter()
+        .filter(|token| is_significant_token(token))
+        .collect();
+    if text_tokens.is_empty() {
+        return false;
+    }
+    loopback_tokens(query)
+        .into_iter()
+        .any(|token| is_significant_token(&token) && text_tokens.contains(&token))
+}
+
 // loopbackTokens: lowercased tokens split on ASCII non-alphanumerics, deduped
 // in first-appearance order (kept independent from the search tokenizer).
 pub(crate) fn loopback_tokens(text: &str) -> Vec<String> {
@@ -336,7 +376,7 @@ fn embed_indexed_claims(
         let body: String = row.get(4)?;
         claims.push(ClaimText {
             id,
-            text: format!("{title} {description} {tags} {body}"),
+            text: embedding_text(&title, &description, &tags, &body),
         });
     }
     if claims.is_empty() {
@@ -399,6 +439,45 @@ mod tests {
         let first = embedder.embed(&["trusted local memory retrieval"]);
         let second = embedder.embed(&["quantum entanglement probability"]);
         assert_ne!(first[0], second[0]);
+    }
+
+    #[test]
+    fn shares_meaningful_token_rejects_unrelated_text() {
+        // Audit repro 13: the query shares nothing with the only claim.
+        assert!(!shares_meaningful_token(
+            "quantum chromodynamics lattice",
+            "Deploy window  the deploy window is tuesday"
+        ));
+        // A paraphrase has no shared token: loopback-v1 cannot express it.
+        assert!(!shares_meaningful_token(
+            "when can we ship to prod",
+            "Deploy window  the deploy window is tuesday"
+        ));
+    }
+
+    #[test]
+    fn shares_meaningful_token_rejects_stopwords_and_short_tokens() {
+        // Only "is"/"the" overlap: a function word is not evidence.
+        assert!(!shares_meaningful_token(
+            "what is the capital of peru",
+            "Deploy window  the deploy window is tuesday"
+        ));
+        // Tokens of two characters or fewer are ignored as well.
+        assert!(!shares_meaningful_token("ai", "ai safety policy"));
+        // A stopword-only claim text has nothing to match on.
+        assert!(!shares_meaningful_token("the is of", "the is of"));
+    }
+
+    #[test]
+    fn shares_meaningful_token_keeps_partial_overlap() {
+        assert!(shares_meaningful_token(
+            "quantum entanglement observer",
+            "Entangled Observer  entanglement observer phenomena"
+        ));
+        assert!(shares_meaningful_token(
+            "quantum entanglement observer",
+            "Quantum Entanglement Observer  quantum entanglement observer discovery"
+        ));
     }
 
     #[test]

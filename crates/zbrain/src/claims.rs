@@ -1,6 +1,6 @@
 //! claims.rs — port of internal/runtime/claim.go and claim_store.go (m2
 //! surface: parse/render/validate/digests/contradictions, WriteDraft, Read,
-//! ScanWorkspace/ScanWorkspaceForTrust, write-once canonical Markdown).
+//! ScanWorkspace/ScanWorkspaceTrusted, write-once canonical Markdown).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write as _;
@@ -17,9 +17,11 @@ use crate::coordination::{
     begin_canonical_mutation_unlocked, run_workspace_generation_test_hook, MutationError,
     WORKSPACE_GENERATION_HOOK_BEFORE_CANONICAL_WRITE,
 };
+use crate::evidence::{validate_claim_evidence, EvidenceValidator};
 use crate::paths::{
     ensure_directory_mode, ensure_file_mode, Paths, RUNTIME_DIRECTORY_MODE, RUNTIME_METADATA_MODE,
 };
+use crate::trust::TrustValidator;
 use crate::workspace::WIKI_TIERS;
 use crate::yaml::{self, Yaml, YamlStyle};
 
@@ -61,6 +63,11 @@ pub struct Claim {
     pub verified_at: String,
     pub verified_by: String,
     pub verified_digest: String,
+    /// Approval signature (ADR 0002): `ed25519`, the key id, and the base64
+    /// signature over the approval message. Empty on legacy unsigned claims.
+    pub verified_alg: String,
+    pub verified_key_id: String,
+    pub verified_sig: String,
     pub stale_after: String,
     pub sources: Vec<ClaimSource>,
     pub evidence_ids: Vec<String>,
@@ -283,6 +290,9 @@ struct VerifiedYaml {
     at: String,
     by: String,
     digest: String,
+    alg: String,
+    key_id: String,
+    sig: String,
 }
 
 #[derive(Default)]
@@ -428,6 +438,9 @@ impl VerifiedYaml {
             at: de::string(map, "at")?,
             by: de::string(map, "by")?,
             digest: de::string(map, "digest")?,
+            alg: de::string(map, "alg")?,
+            key_id: de::string(map, "key_id")?,
+            sig: de::string(map, "sig")?,
         })
     }
 }
@@ -612,10 +625,20 @@ fn parse_legacy_claim_frontmatter(
     body: &[u8],
 ) -> Result<Claim, ClaimError> {
     let metadata = LegacyFrontmatterYaml::from_map(&parse_frontmatter_map(frontmatter)?)?;
-    let (verified_at, verified_by, verified_digest) = metadata
-        .verified
-        .map(|verified| (verified.at, verified.by, verified.digest))
-        .unwrap_or_default();
+    let (verified_at, verified_by, verified_digest, verified_alg, verified_key_id, verified_sig) =
+        metadata
+            .verified
+            .map(|verified| {
+                (
+                    verified.at,
+                    verified.by,
+                    verified.digest,
+                    verified.alg,
+                    verified.key_id,
+                    verified.sig,
+                )
+            })
+            .unwrap_or_default();
     let claim = Claim {
         schema: metadata.schema,
         claim_type: OKF_CLAIM_TYPE.to_string(),
@@ -632,6 +655,9 @@ fn parse_legacy_claim_frontmatter(
         verified_at,
         verified_by,
         verified_digest,
+        verified_alg,
+        verified_key_id,
+        verified_sig,
         stale_after: metadata.stale_after,
         sources: metadata.sources.into_iter().map(source_from_yaml).collect(),
         evidence_ids: metadata.evidence_ids,
@@ -652,6 +678,9 @@ fn parse_legacy_claim_frontmatter(
             verified_at: String::new(),
             verified_by: String::new(),
             verified_digest: String::new(),
+            verified_alg: String::new(),
+            verified_key_id: String::new(),
+            verified_sig: String::new(),
             ..claim.clone()
         };
         if validate_claim(&unsigned).is_err() {
@@ -709,6 +738,9 @@ fn parse_okf_claim_frontmatter(
         claim.verified_at = verified.at;
         claim.verified_by = verified.by;
         claim.verified_digest = verified.digest;
+        claim.verified_alg = verified.alg;
+        claim.verified_key_id = verified.key_id;
+        claim.verified_sig = verified.sig;
     }
     if metadata.zbrain.profile != ZBRAIN_TRUSTED_MEMORY_PROFILE {
         return Err(message(format!(
@@ -811,15 +843,27 @@ pub fn render_claim_markdown(claim: &Claim) -> Result<Vec<u8>, ClaimError> {
     if !claim.verified_at.is_empty()
         || !claim.verified_by.is_empty()
         || !claim.verified_digest.is_empty()
+        || !claim.verified_alg.is_empty()
+        || !claim.verified_key_id.is_empty()
+        || !claim.verified_sig.is_empty()
     {
-        metadata.push((
-            "verified",
-            Yaml::map(vec![
-                ("at", Yaml::scalar(&claim.verified_at)),
-                ("by", Yaml::scalar(&claim.verified_by)),
-                ("digest", Yaml::scalar(&claim.verified_digest)),
-            ]),
-        ));
+        let mut verified: Vec<(&str, Yaml)> = vec![
+            ("at", Yaml::scalar(&claim.verified_at)),
+            ("by", Yaml::scalar(&claim.verified_by)),
+            ("digest", Yaml::scalar(&claim.verified_digest)),
+        ];
+        // Legacy claims render byte-identically: the signature keys appear
+        // only once a claim is signed, so their digests keep verifying.
+        if !claim.verified_alg.is_empty() {
+            verified.push(("alg", Yaml::scalar(&claim.verified_alg)));
+        }
+        if !claim.verified_key_id.is_empty() {
+            verified.push(("key_id", Yaml::scalar(&claim.verified_key_id)));
+        }
+        if !claim.verified_sig.is_empty() {
+            verified.push(("sig", Yaml::scalar(&claim.verified_sig)));
+        }
+        metadata.push(("verified", Yaml::map(verified)));
     }
     metadata.push(("status", Yaml::scalar(&claim.status)));
     if !claim.stale_after.is_empty() {
@@ -991,8 +1035,37 @@ pub fn validate_claim(claim: &Claim) -> Result<(), ClaimError> {
         if claim.verified_by.trim().is_empty() {
             return Err(message("claim verified.by is required"));
         }
+        if claim.verified_by.chars().any(char::is_control) {
+            return Err(message(
+                "claim verified.by must not contain control characters",
+            ));
+        }
         if !claim.verified_digest.starts_with("sha256:") {
             return Err(message("claim verified.digest must use sha256:<hex>"));
+        }
+    }
+    let signed = !claim.verified_alg.is_empty()
+        || !claim.verified_key_id.is_empty()
+        || !claim.verified_sig.is_empty();
+    if signed {
+        if claim.verified_at.is_empty()
+            || claim.verified_by.is_empty()
+            || claim.verified_digest.is_empty()
+        {
+            return Err(message(
+                "claim verified signature requires verified.at, by, and digest",
+            ));
+        }
+        if claim.verified_alg != crate::signing::APPROVAL_ALGORITHM {
+            return Err(message("claim verified.alg must be \"ed25519\""));
+        }
+        if !crate::signing::is_approval_key_id(&claim.verified_key_id) {
+            return Err(message(
+                "claim verified.key_id must be 16 lowercase hex characters",
+            ));
+        }
+        if !crate::signing::is_approval_signature(&claim.verified_sig) {
+            return Err(message("claim verified.sig must be base64 of 64 bytes"));
         }
     }
     if !claim.stale_after.is_empty() && crate::clock::parse_rfc3339(&claim.stale_after).is_err() {
@@ -1159,6 +1232,9 @@ pub fn claim_verification_digest(claim: &Claim) -> Result<String, ClaimError> {
         verified_at: String::new(),
         verified_by: String::new(),
         verified_digest: String::new(),
+        verified_alg: String::new(),
+        verified_key_id: String::new(),
+        verified_sig: String::new(),
         ..claim.clone()
     };
     let rendered = render_claim_markdown(&unsigned)?;
@@ -1467,6 +1543,75 @@ fn is_zbrain_claim_document(contents: &[u8]) -> bool {
     probe.schema == CLAIM_SCHEMA_VERSION || probe.claim_type == OKF_CLAIM_TYPE
 }
 
+/// The fix for a wiki Markdown file the index rebuild rejects: `reindex`
+/// alone cannot clear it.
+pub const WIKI_MARKDOWN_FIX: &str =
+    "move it out of wiki/ or make it a valid claim in a wiki tier, then run zbrain reindex";
+
+/// Whether the regular file at `path` is Markdown that is not a zbrain claim
+/// document, which the rebuild adds to `legacy_unindexed`. Unreadable or
+/// non-regular paths report false so callers keep their own message.
+pub(crate) fn is_non_claim_markdown_file(path: &Path) -> bool {
+    if path.extension().is_none_or(|ext| ext != "md") {
+        return false;
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(info) if info.is_file() => {}
+        _ => return false,
+    }
+    match std::fs::read(path) {
+        Ok(contents) => !is_zbrain_claim_document(&contents),
+        Err(_) => false,
+    }
+}
+
+/// Wiki-relative paths of `.md` files under `wiki_root` that sit outside the
+/// known tiers. The rebuild scans all of `wiki/` and rejects every one of
+/// them (a non-claim file is legacy, a claim file has an unsupported tier),
+/// so freshness must see them too. Only the top level of `wiki/` and
+/// non-tier directories are listed; tier contents are never walked here.
+pub(crate) fn wiki_markdown_outside_tiers(wiki_root: &Path) -> Result<Vec<String>, ClaimError> {
+    let mut children: Vec<PathBuf> = std::fs::read_dir(wiki_root)?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .collect();
+    children.sort();
+    let mut files = Vec::new();
+    for child in children {
+        let info = std::fs::symlink_metadata(&child)?;
+        if info.is_dir() {
+            let name = child.file_name().unwrap_or_default().to_string_lossy();
+            if is_known_wiki_tier(&name) {
+                continue;
+            }
+            visit_markdown(wiki_root, &child, &mut files)?;
+            continue;
+        }
+        if child.extension().is_some_and(|ext| ext == "md") {
+            let rel = child
+                .strip_prefix(wiki_root)
+                .map_err(message)?
+                .to_string_lossy()
+                .to_string();
+            files.push((child.clone(), rel));
+        }
+    }
+    Ok(files.into_iter().map(|(_, rel)| rel).collect())
+}
+
+/// Wiki-relative paths of every non-claim `.md` file under `wiki_root`, in
+/// rebuild order. It reads every Markdown file, so callers use it only on a
+/// failure path.
+pub(crate) fn wiki_non_claim_markdown(wiki_root: &Path) -> Result<Vec<String>, ClaimError> {
+    let mut paths = Vec::new();
+    for (path, rel) in walk_markdown_files(wiki_root)? {
+        if is_non_claim_markdown_file(&path) {
+            paths.push(rel);
+        }
+    }
+    Ok(paths)
+}
+
 impl ClaimStore {
     pub fn new(paths: Paths) -> Self {
         Self { paths, now: None }
@@ -1677,8 +1822,129 @@ impl ClaimStore {
         self.scan_workspace_inner(workspace, true)
     }
 
-    pub fn scan_workspace_for_trust(&self, workspace: &str) -> Result<ClaimScan, ClaimError> {
-        self.scan_workspace_inner(workspace, false)
+    /// Verified read of every claim in a workspace: the digest, evidence
+    /// closure, and support closure rules the index rebuild applies to
+    /// approved claims. A claim that fails them is reported in
+    /// [`ClaimScan::invalid`] and never appears in [`ClaimScan::claims`].
+    pub fn scan_workspace_trusted(&self, workspace: &str) -> Result<ClaimScan, ClaimError> {
+        let mut scan = self.scan_workspace_inner(workspace, false)?;
+        let (trusted, invalid) = self.validate_trusted_claims(workspace, &scan.claims)?;
+        scan.claims = trusted;
+        scan.invalid.extend(invalid);
+        scan.invalid.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then_with(|| left.error.cmp(&right.error))
+        });
+        Ok(scan)
+    }
+
+    /// The trust rule for indexed claims: an approved claim must carry a
+    /// matching verification digest, a verified evidence closure, and a
+    /// verified support closure. Non-approved claims pass through unchanged
+    /// (drafts are promotion candidates, not trusted material). The index
+    /// rebuild, `status`, `memory_status`, and the viewer all use this one
+    /// implementation.
+    pub(crate) fn validate_trusted_claims(
+        &self,
+        workspace: &str,
+        claims: &[Claim],
+    ) -> Result<(Vec<Claim>, Vec<InvalidClaim>), ClaimError> {
+        let mut trust_validator = TrustValidator::from_store(self, workspace)?;
+        let mut evidence_validator = EvidenceValidator::new(self.paths.clone(), workspace)
+            .map_err(|err| message(err.to_string()))?;
+        // Load the owner anchor once per call; a missing or invalid key set
+        // makes every approved claim untrusted (fail closed), and the error
+        // names the fix.
+        let anchor = if claims
+            .iter()
+            .any(|claim| claim.status == CLAIM_STATUS_APPROVED)
+        {
+            Some(crate::signing::KeyStore::open(&self.paths))
+        } else {
+            None
+        };
+        let mut valid_claims = Vec::with_capacity(claims.len());
+        let mut invalid_claims: Vec<InvalidClaim> = Vec::new();
+        for claim in claims {
+            if claim.status != CLAIM_STATUS_APPROVED {
+                valid_claims.push(claim.clone());
+                continue;
+            }
+            let signature = match &anchor {
+                Some(Ok(store)) => crate::signing::verify_claim_signature(claim, store),
+                Some(Err(err)) => Err(err.clone()),
+                None => Ok(()),
+            }
+            .map_err(|err| message(format!("approval signature: {err}")));
+            let result = verify_claim_digest(claim)
+                .and(signature)
+                .and_then(|()| validate_claim_evidence(&mut evidence_validator, claim))
+                .and_then(|()| {
+                    trust_validator
+                        .validate_claim_with_support(claim, &mut |support: &Claim| {
+                            validate_claim_evidence(&mut evidence_validator, support)
+                                .map_err(|err| err.to_string())
+                        })
+                        .map_err(|err| message(err.to_string()))
+                });
+            match result {
+                Ok(()) => valid_claims.push(claim.clone()),
+                Err(err) => invalid_claims.push(InvalidClaim {
+                    path: claim.path.clone(),
+                    error: err.to_string(),
+                }),
+            }
+        }
+        invalid_claims.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then_with(|| left.error.cmp(&right.error))
+        });
+        Ok((valid_claims, invalid_claims))
+    }
+
+    /// Verified single-claim read: [`ClaimStore::read`] plus the trust rule
+    /// for approved claims. Repair and owner-ceremony paths keep using `read`
+    /// so an owner can still revoke or migrate a tampered claim.
+    pub fn read_trusted(&self, workspace: &str, id: &str) -> Result<Claim, ClaimError> {
+        let claim = self.read(workspace, id)?;
+        if claim.status != CLAIM_STATUS_APPROVED {
+            return Ok(claim);
+        }
+        let (trusted, invalid) =
+            self.validate_trusted_claims(workspace, std::slice::from_ref(&claim))?;
+        match trusted.into_iter().next() {
+            Some(trusted) => Ok(trusted),
+            None => Err(message(format!(
+                "claim {} is not trusted: {}",
+                claim.id,
+                invalid
+                    .first()
+                    .map(|entry| entry.error.as_str())
+                    .unwrap_or("unknown reason")
+            ))),
+        }
+    }
+
+    /// Approved claims whose signature does not verify against the anchor.
+    /// `doctor` uses this to name the batch re-sign command; a missing anchor
+    /// is reported separately, so this returns only signature failures.
+    pub fn unsigned_approved_claims(&self, workspace: &str) -> Result<Vec<String>, ClaimError> {
+        let store = match crate::signing::KeyStore::open(&self.paths) {
+            Ok(store) => store,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let scan = self.scan_workspace_inner(workspace, false)?;
+        let mut ids: Vec<String> = scan
+            .claims
+            .iter()
+            .filter(|claim| claim.status == CLAIM_STATUS_APPROVED)
+            .filter(|claim| crate::signing::verify_claim_signature(claim, &store).is_err())
+            .map(|claim| claim.id.clone())
+            .collect();
+        ids.sort();
+        Ok(ids)
     }
 
     pub(crate) fn scan_workspace_inner(
@@ -1968,12 +2234,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("zbrain-claims-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let paths = Paths::resolve(Options {
+        let mut paths = Paths::resolve(Options {
             cwd: Some(dir.clone()),
             home_dir: Some(dir.clone()),
             runtime_dir: Some(dir.join(".zbrain")),
         })
         .unwrap();
+        paths.key_dir = crate::signing::test_key_dir();
         ensure_config(&paths.config_file).unwrap();
         let clock = FixedClock::new(Utc.with_ymd_and_hms(2026, 7, 30, 9, 0, 0).unwrap());
         crate::workspace::create_workspace(&paths, "research", &clock).unwrap();
@@ -2587,6 +2854,7 @@ mod tests {
         approved.verified_by = "owner".into();
         approved.verified_digest = String::new();
         approved.verified_digest = claim_verification_digest(&approved).unwrap();
+        crate::signing::sign_test_claim(&mut approved);
         approved
     }
 
@@ -2683,7 +2951,7 @@ mod tests {
         );
         assert_eq!(sha256_file(&write_path), before_nested);
 
-        let trust_scan = store.scan_workspace_for_trust("research").unwrap();
+        let trust_scan = store.scan_workspace("research").unwrap();
         assert!(trust_scan.claims.is_empty());
         assert_eq!(trust_scan.invalid.len(), 2);
         let _ = std::fs::remove_dir_all(&dir);

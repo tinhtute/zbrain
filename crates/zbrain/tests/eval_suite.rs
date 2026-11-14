@@ -50,15 +50,17 @@ fn eval_paths(name: &str) -> (std::path::PathBuf, Paths) {
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let paths = Paths::resolve(Options {
+    let mut paths = Paths::resolve(Options {
         cwd: Some(dir.join("project")),
         home_dir: Some(dir.clone()),
         runtime_dir: Some(dir.join(".zbrain")),
     })
     .unwrap();
+    paths.key_dir = dir.join("xdg/zbrain-keys");
     ensure_config(&paths.config_file).unwrap();
     zbrain::assets::extract_bundled_assets(&paths).unwrap();
     create_workspace(&paths, "research", &FixedClock::new(eval_now())).unwrap();
+    zbrain::signing::KeyStore::init(&paths, eval_now()).unwrap();
     (dir, paths)
 }
 
@@ -697,17 +699,43 @@ fn cli_draft_id(paths: &Paths, title: &str, body: &str) -> String {
     parsed["id"].as_str().unwrap().to_string()
 }
 
+/// Approves through the CLI by answering the owner ceremony with the digest
+/// suffix it will ask for.
+fn cli_approve(paths: &Paths, id: &str) {
+    let (mut app, out) = cli_app(paths, "");
+    let prepare = claim_store(paths)
+        .approve_challenge_prepare("research", id)
+        .unwrap();
+    let suffix =
+        digest_suffix(&zbrain::approval::compute_challenge_action_digest(&prepare)).to_string();
+    app.prompt = PromptSource::Scripted(vec![suffix]);
+    cli_run(&mut app, &out, &["claim", "approve", id]);
+}
+
 #[test]
 fn eval_lifecycle_chain_cli() {
     let (_dir, paths) = eval_paths("lifecycle-cli");
     let store = claim_store(&paths);
 
     let original_id = cli_draft_id(&paths, "Lifecycle Chain", "chain original body\n");
-    let (mut app, out) = cli_app(&paths, "");
-    cli_run(&mut app, &out, &["claim", "approve", &original_id]);
+    cli_approve(&paths, &original_id);
     let original = store.read("research", &original_id).unwrap();
     assert_eq!(original.status, CLAIM_STATUS_APPROVED);
     verify_claim_digest(&original).unwrap();
+
+    // Approval went through the owner ceremony: one challenge bound to the
+    // claim, granted and consumed.
+    let challenges_dir = paths.workspaces_dir.join("research/.zbrain/challenges");
+    let records: Vec<serde_json::Value> = std::fs::read_dir(&challenges_dir)
+        .unwrap()
+        .map(|entry| {
+            serde_json::from_slice(&std::fs::read(entry.unwrap().path()).unwrap()).unwrap()
+        })
+        .collect();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0]["claim_id"], serde_json::json!(original_id));
+    assert_eq!(records[0]["granted"], true);
+    assert_eq!(records[0]["consumed"], true);
 
     let (mut app, out) = cli_app(&paths, "chain replacement body\n");
     let raw = cli_run(
@@ -729,8 +757,7 @@ fn eval_lifecycle_chain_cli() {
         .as_str()
         .unwrap()
         .to_string();
-    let (mut app, out) = cli_app(&paths, "");
-    cli_run(&mut app, &out, &["claim", "approve", &replacement_id]);
+    cli_approve(&paths, &replacement_id);
     let superseded = store.read("research", &original_id).unwrap();
     let replacement = store.read("research", &replacement_id).unwrap();
     assert_eq!(superseded.status, CLAIM_STATUS_SUPERSEDED);

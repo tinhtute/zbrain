@@ -20,17 +20,19 @@ fn capture() {
     let dir = std::env::temp_dir().join("w2t2_rs_fixture");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let paths = Paths::resolve(Options {
+    let mut paths = Paths::resolve(Options {
         cwd: Some(dir.clone()),
         home_dir: Some(dir.clone()),
         runtime_dir: Some(dir.join(".zbrain")),
     })
     .unwrap();
+    paths.key_dir = dir.join("xdg/zbrain-keys");
     ensure_config(&paths.config_file).unwrap();
     // Pinned to the Go fixture's wall-clock stamps (evidence captured_at ==
     // claim generated.at == 2026-09-05T15:07:31Z) so derived digests match.
     let clock = FixedClock::new(Utc.with_ymd_and_hms(2026, 9, 5, 15, 7, 31).unwrap());
     create_workspace(&paths, "research", &clock).unwrap();
+    zbrain::signing::KeyStore::init(&paths, clock.now()).unwrap();
 
     let source = dir.join("source.txt");
     std::fs::write(&source, b"source bytes").unwrap();

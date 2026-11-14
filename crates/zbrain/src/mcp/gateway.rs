@@ -295,8 +295,7 @@ impl ZbrainRegistry {
                 workspace: workspace.clone(),
                 ..Default::default()
             };
-            if let Ok(scan) =
-                ClaimStore::new(self.paths.clone()).scan_workspace_for_trust(&workspace)
+            if let Ok(scan) = ClaimStore::new(self.paths.clone()).scan_workspace_trusted(&workspace)
             {
                 summary.approved = scan.claims.len() as i64;
                 summary.invalid = scan.invalid.len() as i64;
@@ -848,7 +847,7 @@ impl ZbrainRegistry {
         id: &str,
     ) -> Option<ReadResourceResult> {
         let claim = ClaimStore::new(self.paths.clone())
-            .read(workspace, id)
+            .read_trusted(workspace, id)
             .ok()?;
         Some(ReadResourceResult::text(
             uri,
@@ -1732,6 +1731,18 @@ fn summary_output_json(schema_version: i64, summary: &IndexSummary) -> OrderedJs
         ));
     }
     entries.push(("legacy", OrderedJson::Int(summary.legacy)));
+    if !summary.legacy_files.is_empty() {
+        entries.push((
+            "legacy_files",
+            OrderedJson::Array(
+                summary
+                    .legacy_files
+                    .iter()
+                    .map(invalid_claim_entry)
+                    .collect(),
+            ),
+        ));
+    }
     entries.push(("rebuild_state", OrderedJson::string(&summary.rebuild_state)));
     entries.push((
         "manifest_digest",
@@ -2361,6 +2372,26 @@ fn claim_transition_authorization_json(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn summary_output_reports_legacy_files_like_the_cli() {
+        use super::*;
+        let summary = IndexSummary {
+            legacy: 1,
+            legacy_files: vec![InvalidClaimSerde {
+                path: "notes/todo.md".into(),
+                error: "not a zbrain claim".into(),
+            }],
+            ..IndexSummary::default()
+        };
+        let mcp = super::summary_output_json(1, &summary).compact();
+        let mcp: serde_json::Value = serde_json::from_str(&mcp).unwrap();
+        let cli = serde_json::to_value(&summary).unwrap();
+        assert_eq!(mcp["legacy_files"], cli["legacy_files"], "{mcp}");
+
+        let empty = super::summary_output_json(1, &IndexSummary::default()).compact();
+        assert!(!empty.contains("legacy_files"), "{empty}");
+    }
+
     use super::*;
     use crate::claims::{new_claim_id, CLAIM_BASIS_EVIDENCE, OKF_CLAIM_TYPE};
     use crate::clock::{rfc3339, FixedClock};
@@ -2392,12 +2423,13 @@ mod tests {
             std::env::temp_dir().join(format!("zbrain-mcp-gateway-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let paths = Paths::resolve(Options {
+        let mut paths = Paths::resolve(Options {
             cwd: Some(dir.clone()),
             home_dir: Some(dir.clone()),
             runtime_dir: Some(dir.join(".zbrain")),
         })
         .unwrap();
+        paths.key_dir = crate::signing::test_key_dir();
         ensure_config(&paths.config_file).unwrap();
         let clock = FixedClock::new(Utc.with_ymd_and_hms(2026, 8, 20, 0, 0, 0).unwrap());
         create_workspace(&paths, "research", &clock).unwrap();
@@ -3843,10 +3875,16 @@ mod tests {
         assert_eq!(status_value["embedding"]["indexed"], 1);
         assert_eq!(status_value["embedding"]["eligible"], 1);
 
+        // Hybrid retrieval widens recall to partial token overlap: the query
+        // shares "resource" with the fixture claim but not every token, so the
+        // lexical AND misses and the vector side finds it. A query sharing no
+        // token at all must gap (see tests/embed_readiness.rs).
         let hybrid = reg
             .call_tool(
                 "memory_ask",
-                Some(&args(r#"{"query":"embedding-only-term","embedding":true}"#)),
+                Some(&args(
+                    r#"{"query":"resource embedding-only-term","embedding":true}"#,
+                )),
             )
             .unwrap();
         let hybrid_value: Value = serde_json::from_str(&hybrid.content[0].text).unwrap();

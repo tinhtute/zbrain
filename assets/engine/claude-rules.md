@@ -32,7 +32,7 @@ In the command summaries below, `"$value"` means one argv value and `[...]` mean
 |---|---|
 | Capture a local evidence snapshot | `zbrain evidence add --file "$file" --origin "$origin" [--media-type "$media_type"] [--workspace "$workspace"]` |
 | Draft an OKF claim concept from stdin | `zbrain claim draft --tier "$tier" --title "$title" --basis "$basis" [--evidence "$evidence_id"]... [--support "$support_id"]... [--conflicts-with "$conflict_id"]... [--workspace "$workspace"]` |
-| Promote a valid draft claim | `zbrain claim approve "$id" [--workspace "$workspace"]` |
+| Promote a valid draft claim (owner only) | `zbrain claim approve "$id" [--workspace "$workspace"]` in an interactive terminal; the owner confirms the last 16 hex characters of the action digest. A piped or agent-shell caller is refused — hand the draft to the owner. |
 | Replace an approved claim | `zbrain claim supersede "$id" --tier "$tier" --title "$title" --basis "$basis" [--evidence "$evidence_id"]... [--support "$support_id"]... [--conflicts-with "$conflict_id"]... [--workspace "$workspace"]` then approve the replacement |
 | Revoke a claim | `zbrain claim revoke "$id" --reason "$reason" [--workspace "$workspace"]` |
 | Convert legacy claim files | `zbrain migrate okf [--workspace "$workspace"]` |

@@ -99,7 +99,7 @@
       <ol class="trustflow">
         <li><code>evidence add</code> copies an already-local file into an immutable evidence snapshot and records its metadata.</li>
         <li><code>claim draft</code> writes an OKF claim candidate. The claim body is read from stdin; drafts are never trusted answer material.</li>
-        <li><code>claim approve</code> validates the claim basis and referenced evidence or supporting claims, then records <code>verified.at</code>, <code>verified.by</code>, and <code>verified.digest</code>.</li>
+        <li><code>claim approve</code> runs the owner ceremony (confirm the last 16 hex characters of the action digest on a TTY) and validates the claim basis and referenced evidence or supporting claims before recording <code>verified.at</code>, <code>verified.by</code>, and <code>verified.digest</code>.</li>
         <li><code>reindex</code> scans canonical Markdown and evidence, validates trust inputs, and publishes a clean or rejected disposable index without rewriting canonical files.</li>
         <li><code>ask</code> checks index freshness and the returned claim's canonical binding and trust dependencies before returning JSON. Conflicts produce <code>blocked</code>; no matching approved claim produces <code>gap</code>.</li>
       </ol>

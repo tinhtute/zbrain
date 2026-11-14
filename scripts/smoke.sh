@@ -28,32 +28,50 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 1
 fi
 
+# The owner ceremony needs a real TTY, which CI does not have; the driver
+# allocates one and answers the confirmation prompt. Nothing is bypassed.
+if [ "$use_cargo" -eq 1 ]; then
+  (cd "$root" && cargo build -q -p zbrain --bin zbrain)
+  approve_bin="$root/target/debug/zbrain"
+else
+  approve_bin="$(cd "$(dirname "$bin")" && pwd -P)/$(basename "$bin")"
+fi
+owner_approve="$root/scripts/owner-approve.py"
+
 tmp_root="$(cd "${TMPDIR:-/tmp}" && pwd -P)"
 tmp_home="$(mktemp -d "$tmp_root/zbrain-smoke.XXXXXX")"
+tmp_xdg="$(mktemp -d "$tmp_root/zbrain-smoke-xdg.XXXXXX")"
 source_file="$(mktemp "$tmp_root/zbrain-source.XXXXXX")"
 cleanup() {
   if command -v trash >/dev/null 2>&1; then
     trash "$source_file" 2>/dev/null || rm -f "$source_file"
     trash "$tmp_home" 2>/dev/null || rm -rf "$tmp_home"
+    trash "$tmp_xdg" 2>/dev/null || rm -rf "$tmp_xdg"
   else
     rm -f "$source_file"
     rm -rf "$tmp_home"
+    rm -rf "$tmp_xdg"
   fi
 }
 trap cleanup EXIT
 
 export ZBRAIN_HOME="$tmp_home"
+# The owner approval key lives outside the runtime root (ADR 0002). Smoke uses
+# a throwaway key under a temp XDG_CONFIG_HOME, so a smoke-signed claim is
+# invalid under the owner's real home and vice versa.
+export XDG_CONFIG_HOME="$tmp_xdg"
 printf 'trusted source bytes\n' > "$source_file"
 
 zbrain --help > /dev/null
 zbrain setup
+zbrain key init > /dev/null
 zbrain workspace create research
 zbrain workspace current
 evidence_json="$(zbrain evidence add --file "$source_file" --origin "$source_file" --media-type text/plain)"
 evidence_id="$(printf '%s' "$evidence_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
 claim_json="$(printf 'trusted smoke answer\n' | zbrain claim draft --tier projects --title 'Smoke Claim' --basis evidence --evidence "$evidence_id")"
 claim_id="$(printf '%s' "$claim_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
-zbrain claim approve "$claim_id"
+python3 "$owner_approve" --bin "$approve_bin" "$claim_id"
 zbrain reindex
 zbrain ask trusted smoke
 zbrain status > /dev/null

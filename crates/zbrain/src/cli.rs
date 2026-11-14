@@ -16,6 +16,7 @@ use crate::clock::{rfc3339, Clock, SystemClock};
 use crate::embedder::{rebuild_with_options, RebuildOptions};
 use crate::evidence::EvidenceStore;
 use crate::index::{approved_catalog, IndexStore, IndexSummary};
+use crate::lifecycle::ClaimMutationOptions;
 use crate::paths::Paths;
 use crate::query::{trusted_query, TrustedQueryOptions};
 use crate::setup::run_setup;
@@ -65,12 +66,34 @@ impl std::error::Error for CliError {}
 
 /// Source of owner confirmation lines for the grant walk. The binary always
 /// uses [`PromptSource::Stdin`] (TTY-gated like the Go oracle); tests inject
-/// [`PromptSource::Scripted`] lines.
-#[derive(Debug, Default)]
+/// [`PromptSource::Scripted`] lines, or [`PromptSource::Live`] when the answer
+/// depends on what the command just printed (key recovery).
+#[derive(Default)]
 pub enum PromptSource {
     #[default]
     Stdin,
     Scripted(Vec<String>),
+    Live(Box<dyn FnMut() -> String>),
+}
+
+impl std::fmt::Debug for PromptSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stdin => formatter.write_str("Stdin"),
+            Self::Scripted(lines) => formatter.debug_tuple("Scripted").field(lines).finish(),
+            Self::Live(_) => formatter.write_str("Live"),
+        }
+    }
+}
+
+struct LivePrompt {
+    answer: Box<dyn FnMut() -> String>,
+}
+
+impl ApprovalPrompt for LivePrompt {
+    fn read_confirmation(&mut self) -> std::io::Result<String> {
+        Ok((self.answer)())
+    }
 }
 
 struct VecPrompt {
@@ -143,6 +166,7 @@ impl App {
             "mcp" => self.run_mcp(&args[1..]),
             "view" => self.run_view(&args[1..]),
             "approval" => self.run_approval(&args[1..]),
+            "key" => self.run_key(&args[1..]),
             other => {
                 if other.starts_with('-') {
                     return Err(unknown_flag(other));
@@ -167,7 +191,7 @@ impl App {
             workspace: workspace.clone(),
             ..IndexSummary::default()
         };
-        match ClaimStore::new(self.paths.clone()).scan_workspace_for_trust(&workspace) {
+        match ClaimStore::new(self.paths.clone()).scan_workspace_trusted(&workspace) {
             Ok(scan) => {
                 summary.approved = scan.claims.len() as i64;
                 summary.invalid = scan.invalid.len() as i64;
@@ -231,7 +255,12 @@ impl App {
         let workspace = self.resolve_workspace(parsed.single("workspace"))?;
         let mut findings: Vec<String> = Vec::new();
         let mut freshness_failed = false;
+        // Some(other_invalid) when non-claim wiki Markdown blocks the index.
+        let mut wiki_markdown: Option<i64> = None;
         if let Err(err) = IndexStore::new(self.paths.clone()).check_fresh(&workspace) {
+            if let crate::index::IndexError::WikiMarkdown { other_invalid, .. } = &err {
+                wiki_markdown = Some(*other_invalid);
+            }
             findings.push(err.to_string());
             freshness_failed = true;
         }
@@ -254,6 +283,21 @@ impl App {
                 }
             }
         }
+        match crate::signing::KeyStore::open(&self.paths) {
+            Err(err) => findings.push(format!("approval signing key unavailable: {err}")),
+            Ok(_) => {
+                let unsigned = ClaimStore::new(self.paths.clone())
+                    .unsigned_approved_claims(&workspace)
+                    .map_err(|err| CliError::failure(err.to_string()))?;
+                if !unsigned.is_empty() {
+                    findings.push(format!(
+                        "{} approved claims are unsigned; run `zbrain claim resign --workspace {}`",
+                        unsigned.len(),
+                        workspace
+                    ));
+                }
+            }
+        }
         if probe {
             let emb_store = crate::embedder::EmbeddingStore::new(self.paths.clone());
             match emb_store.count(&workspace) {
@@ -271,7 +315,13 @@ impl App {
             "degraded"
         };
         let mut next_action = "zbrain reindex";
-        if !freshness_failed && !structural.is_empty() {
+        if let Some(other_invalid) = wiki_markdown {
+            next_action = if other_invalid == 0 {
+                "move non-claim files out of wiki/, then zbrain reindex"
+            } else {
+                "move non-claim files out of wiki/, fix the other invalid trust inputs zbrain reindex lists, then zbrain reindex"
+            };
+        } else if !freshness_failed && !structural.is_empty() {
             next_action = "review structural findings";
         }
         #[derive(Serialize)]
@@ -436,6 +486,7 @@ impl App {
             PromptSource::Scripted(lines) => Ok(Box::new(VecPrompt {
                 lines: lines.into_iter().collect(),
             })),
+            PromptSource::Live(answer) => Ok(Box::new(LivePrompt { answer })),
         }
     }
 
@@ -658,7 +709,7 @@ impl App {
     fn run_claim(&mut self, args: &[String]) -> Result<(), CliError> {
         if args.is_empty() {
             return Err(CliError::usage(
-                "claim requires a subcommand: draft, approve, supersede, or revoke",
+                "claim requires a subcommand: draft, approve, resign, supersede, or revoke",
             ));
         }
         if help_requested(args) {
@@ -671,6 +722,7 @@ impl App {
         match args[0].as_str() {
             "draft" => self.run_claim_draft(&args[1..]),
             "approve" => self.run_claim_approve(&args[1..]),
+            "resign" => self.run_claim_resign(&args[1..]),
             "supersede" => self.run_claim_supersede(&args[1..]),
             "revoke" => self.run_claim_revoke(&args[1..]),
             other => Err(CliError::failure(format!(
@@ -741,13 +793,273 @@ impl App {
             ));
         }
         let workspace = self.resolve_workspace(parsed.single("workspace"))?;
+        // The owner ceremony is the only approval path: refuse a piped caller
+        // before reading the claim, so a script learns nothing and mutates
+        // nothing.
+        let mut prompt = self.make_prompt()?;
+        // Fail before a challenge is prepared when the owner key is missing or
+        // invalid: nothing is mutated and no token is issued.
+        crate::signing::KeyStore::open(&self.paths)
+            .map_err(|err| CliError::failure(format!("approval signing key unavailable: {err}")))?;
+        let store = ClaimStore::with_clock(self.paths.clone(), self.clock.clone());
+        let prepare = store
+            .approve_challenge_prepare(&workspace, &parsed.rest[0])
+            .map_err(|err| CliError::failure(err.to_string()))?;
+        let prepared = store
+            .prepare_challenge(&workspace, prepare)
+            .map_err(|err| CliError::failure(err.to_string()))?;
+        let challenges =
+            crate::approval::ChallengeStore::with_clock(self.paths.clone(), self.clock.clone());
+        let granted = run_grant(
+            &challenges,
+            &prepared.challenge,
+            &workspace,
+            &mut self.stderr,
+            &mut *prompt,
+        )
+        .map_err(|err| CliError::failure(err.to_string()))?;
+        let token = granted.token;
         IndexStore::new(self.paths.clone())
             .mark_dirty(&workspace)
             .map_err(|err| CliError::failure(err.to_string()))?;
-        let claim = ClaimStore::new(self.paths.clone())
-            .approve(&workspace, &parsed.rest[0])
+        let claim = store
+            .apply_challenge(
+                &workspace,
+                &prepared.challenge.id,
+                &token,
+                ClaimMutationOptions::default(),
+            )
             .map_err(|err| CliError::failure(err.to_string()))?;
         self.write_claim_mutation(&workspace, &claim)
+    }
+
+    /// Batch owner ceremony: re-sign every approved claim with the active
+    /// owner key. Lists id, title, approval time, and digest, honors
+    /// `--exclude`, and binds the ordered (id, digest) list with the same
+    /// action digest the approval ceremony uses.
+    fn run_claim_resign(&mut self, args: &[String]) -> Result<(), CliError> {
+        if help_requested(args) {
+            self.print_claim_resign_help();
+            return Ok(());
+        }
+        let parsed = parse_flags(args, &["workspace", "exclude"])?;
+        if !parsed.rest.is_empty() {
+            return Err(CliError::usage(
+                "usage: zbrain claim resign [--workspace <name>] [--exclude <id>]...",
+            ));
+        }
+        let workspace = self.resolve_workspace(parsed.single("workspace"))?;
+        let excludes = parsed.all("exclude");
+        let mut prompt = self.make_prompt()?;
+        let store = ClaimStore::with_clock(self.paths.clone(), self.clock.clone());
+        let candidates = store
+            .resign_candidates(&workspace)
+            .map_err(|err| CliError::failure(err.to_string()))?;
+        #[derive(Serialize)]
+        struct ResignOutput {
+            schema_version: u32,
+            workspace: String,
+            #[serde(flatten)]
+            report: crate::lifecycle::ResignReport,
+        }
+        if candidates.is_empty() {
+            return write_json(
+                &mut self.stdout,
+                &ResignOutput {
+                    schema_version: 1,
+                    workspace,
+                    report: crate::lifecycle::ResignReport::default(),
+                },
+            );
+        }
+        let to_sign: Vec<&crate::lifecycle::ResignCandidate> = candidates
+            .iter()
+            .filter(|candidate| !excludes.contains(&candidate.id))
+            .collect();
+        if to_sign.is_empty() {
+            return Err(CliError::failure(
+                "every approved claim is excluded; nothing to sign",
+            ));
+        }
+        for candidate in &candidates {
+            let marker = if excludes.contains(&candidate.id) {
+                "excluded"
+            } else {
+                "sign"
+            };
+            let _ = writeln!(
+                self.stderr,
+                "{marker} {} {} approved {} {}",
+                candidate.id, candidate.title, candidate.verified_at, candidate.digest
+            );
+        }
+        let items: Vec<crate::approval::ChallengeItem> = to_sign
+            .iter()
+            .map(|candidate| crate::approval::ChallengeItem {
+                claim_id: candidate.id.clone(),
+                canonical_draft_digest: candidate.digest.clone(),
+            })
+            .collect();
+        // The confirmed (id, digest) pairs are the whole mandate: a claim
+        // written or changed while the prompt waits is skipped, not signed.
+        let targets: Vec<crate::lifecycle::ResignTarget> = to_sign
+            .iter()
+            .map(|candidate| crate::lifecycle::ResignTarget {
+                id: candidate.id.clone(),
+                digest: candidate.digest.clone(),
+                verified_at: candidate.verified_at.clone(),
+                verified_by: candidate.verified_by.clone(),
+            })
+            .collect();
+        let action_digest =
+            crate::approval::compute_challenge_action_digest(&crate::approval::ChallengePrepare {
+                workspace: workspace.clone(),
+                operation: "resign".to_string(),
+                items,
+                ..crate::approval::ChallengePrepare::default()
+            });
+        let _ = writeln!(self.stderr, "action digest: {action_digest}");
+        let _ = write!(
+            self.stderr,
+            "confirm the last 16 hex characters of the action digest: "
+        );
+        let _ = self.stderr.flush();
+        let confirm = prompt
+            .read_confirmation()
+            .map_err(|err| CliError::failure(err.to_string()))?;
+        if confirm.trim() != crate::approval::action_digest_suffix(&action_digest) {
+            return Err(CliError::failure(
+                "claim resign denied: digest suffix mismatch",
+            ));
+        }
+        let _ = writeln!(self.stderr);
+        let report = store
+            .resign_approved(&workspace, &targets, &excludes)
+            .map_err(|err| CliError::failure(err.to_string()))?;
+        IndexStore::new(self.paths.clone())
+            .mark_dirty(&workspace)
+            .map_err(|err| CliError::failure(err.to_string()))?;
+        write_json(
+            &mut self.stdout,
+            &ResignOutput {
+                schema_version: 1,
+                workspace,
+                report,
+            },
+        )
+    }
+
+    fn run_key(&mut self, args: &[String]) -> Result<(), CliError> {
+        if args.is_empty() {
+            return Err(CliError::usage("key requires a subcommand: init"));
+        }
+        if help_requested(args) {
+            self.print_key_help();
+            return Ok(());
+        }
+        if args[0].starts_with('-') {
+            return Err(unknown_flag(&args[0]));
+        }
+        match args[0].as_str() {
+            "init" => self.run_key_init(&args[1..]),
+            other => Err(CliError::failure(format!(
+                "unknown key subcommand: {other}"
+            ))),
+        }
+    }
+
+    fn run_key_init(&mut self, args: &[String]) -> Result<(), CliError> {
+        if help_requested(args) {
+            self.print_key_init_help();
+            return Ok(());
+        }
+        let recover = args.iter().any(|arg| arg == "--recover");
+        let rest: Vec<String> = args
+            .iter()
+            .filter(|arg| arg.as_str() != "--recover")
+            .cloned()
+            .collect();
+        let parsed = parse_flags(&rest, NO_FLAGS)?;
+        if !parsed.rest.is_empty() {
+            return Err(CliError::usage("usage: zbrain key init [--recover]"));
+        }
+        if recover {
+            return self.run_key_recover();
+        }
+        let report = crate::signing::KeyStore::init(&self.paths, self.clock.now())
+            .map_err(|err| CliError::failure(err.to_string()))?;
+        self.write_key_init(&report, None)
+    }
+
+    /// Recovery after private-key loss (ADR 0002): the new key is generated
+    /// but not written until the owner types its id. Existing claims keep
+    /// verifying against the retired public keys.
+    fn run_key_recover(&mut self) -> Result<(), CliError> {
+        let mut prompt = self.make_prompt()?;
+        let recovery = crate::signing::KeyStore::recover(&self.paths, self.clock.now())
+            .map_err(|err| CliError::failure(err.to_string()))?;
+        let retired = recovery.retired_key_ids();
+        let _ = writeln!(
+            self.stderr,
+            "recovering the approval key: the private key is gone"
+        );
+        if !retired.is_empty() {
+            let _ = writeln!(
+                self.stderr,
+                "existing claims keep verifying under retired key(s): {}",
+                retired.join(", ")
+            );
+        }
+        let _ = writeln!(self.stderr, "new key id: {}", recovery.key_id());
+        let _ = write!(self.stderr, "type the new key id to confirm: ");
+        let _ = self.stderr.flush();
+        let typed = prompt
+            .read_confirmation()
+            .map_err(|err| CliError::failure(err.to_string()))?;
+        if typed.trim() != recovery.key_id() {
+            return Err(CliError::failure(
+                "key recovery denied: new key id mismatch",
+            ));
+        }
+        let _ = writeln!(self.stderr);
+        let report = recovery
+            .commit()
+            .map_err(|err| CliError::failure(err.to_string()))?;
+        self.write_key_init(&report, Some(retired))
+    }
+
+    fn write_key_init(
+        &mut self,
+        report: &crate::signing::KeyInit,
+        retired: Option<Vec<String>>,
+    ) -> Result<(), CliError> {
+        #[derive(Serialize)]
+        struct KeyInitOutput {
+            schema_version: u32,
+            key_id: String,
+            dir: String,
+            private_key: String,
+            public_key: String,
+            keys_file: String,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            recovered: Option<bool>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            retired_key_ids: Option<Vec<String>>,
+        }
+        let recovered = retired.is_some();
+        write_json(
+            &mut self.stdout,
+            &KeyInitOutput {
+                schema_version: 1,
+                key_id: report.key_id.clone(),
+                dir: report.dir.display().to_string(),
+                private_key: report.private_key.display().to_string(),
+                public_key: report.public_key.display().to_string(),
+                keys_file: report.keys_file.display().to_string(),
+                recovered: recovered.then_some(true),
+                retired_key_ids: retired,
+            },
+        )
     }
 
     fn run_claim_supersede(&mut self, args: &[String]) -> Result<(), CliError> {
@@ -1104,6 +1416,7 @@ impl App {
              \x20 evidence check [--workspace <name>]\n\
              \x20 claim draft --tier <tier> --title <title> --basis <owner|evidence|derived> [--evidence <id>]... [--support <id>]... [--conflicts-with <id>]... [--workspace <name>]\n\
              \x20 claim approve <id> [--workspace <name>]\n\
+             \x20 claim resign [--workspace <name>] [--exclude <id>]...\n\
              \x20 claim supersede <id> --tier <tier> --title <title> --basis <owner|evidence|derived> [--evidence <id>]... [--support <id>]... [--conflicts-with <id>]... [--workspace <name>]\n\
              \x20 claim revoke <id> --reason <text> [--workspace <name>]\n\
              \x20 migrate okf [--workspace <name>]\n\
@@ -1115,6 +1428,7 @@ impl App {
              \x20 view\n\
              \x20 approval show <challenge-id>\n\
              \x20 approval grant <challenge-id>\n\
+             \x20 key init\n\
              \x20 version\n\
              \n\
              Use `zbrain <command> --help` for command-specific help.\n"
@@ -1180,7 +1494,7 @@ impl App {
     fn print_claim_help(&mut self) {
         let _ = write!(
             self.stdout,
-            "Usage:\n  zbrain claim draft --tier <tier> --title <title> --basis <owner|evidence|derived> [--evidence <id>]... [--support <id>]... [--conflicts-with <id>]... [--workspace <name>]\n  zbrain claim approve <id> [--workspace <name>]\n  zbrain claim supersede <id> --tier <tier> --title <title> --basis <owner|evidence|derived> [--evidence <id>]... [--support <id>]... [--conflicts-with <id>]... [--workspace <name>]\n  zbrain claim revoke <id> --reason <text> [--workspace <name>]\n\nManage the four-state OKF claim lifecycle.\n"
+            "Usage:\n  zbrain claim draft --tier <tier> --title <title> --basis <owner|evidence|derived> [--evidence <id>]... [--support <id>]... [--conflicts-with <id>]... [--workspace <name>]\n  zbrain claim approve <id> [--workspace <name>]\n  zbrain claim resign [--workspace <name>] [--exclude <id>]...\n  zbrain claim supersede <id> --tier <tier> --title <title> --basis <owner|evidence|derived> [--evidence <id>]... [--support <id>]... [--conflicts-with <id>]... [--workspace <name>]\n  zbrain claim revoke <id> --reason <text> [--workspace <name>]\n\nManage the four-state OKF claim lifecycle.\n"
         );
     }
 
@@ -1194,7 +1508,28 @@ impl App {
     fn print_claim_approve_help(&mut self) {
         let _ = write!(
             self.stdout,
-            "Usage: zbrain claim approve <id> [--workspace <name>]\n\nPromote a valid draft claim.\n"
+            "Usage: zbrain claim approve <id> [--workspace <name>]\n\nPromote a valid draft claim through the owner ceremony: confirm the last 16\nhex characters of the action digest in an interactive TTY.\n"
+        );
+    }
+
+    fn print_claim_resign_help(&mut self) {
+        let _ = write!(
+            self.stdout,
+            "Usage: zbrain claim resign [--workspace <name>] [--exclude <id>]...\n\nRe-sign every approved claim with the active owner key in one TTY ceremony.\nThe command lists each claim's id, title, approval time, and digest, prints\nthe batch action digest, and asks for its last 16 hex characters. Claims\nnamed with --exclude stay unsigned and untrusted. Re-running is a no-op for\nclaims already signed by the active key.\n"
+        );
+    }
+
+    fn print_key_help(&mut self) {
+        let _ = write!(
+            self.stdout,
+            "Usage:\n  zbrain key init\n\nManage the owner approval key (ADR 0002).\n"
+        );
+    }
+
+    fn print_key_init_help(&mut self) {
+        let _ = write!(
+            self.stdout,
+            "Usage: zbrain key init [--recover]\n\nCreate the owner approval key at $XDG_CONFIG_HOME/zbrain-keys\n(fallback ~/.config/zbrain-keys): directory 0700, files 0600. Refuses a\nsymlinked key path, a path inside ZBRAIN_HOME, looser modes, and an existing\nkey (rotation is a separate ceremony).\n\n--recover  After private-key loss: generate a new key, print its key id, and\n           write it only when the owner types that id. Previous keys are\n           retired, so existing claims keep verifying.\n"
         );
     }
 
@@ -1233,7 +1568,7 @@ impl App {
     fn print_view_help(&mut self) {
         let _ = write!(
             self.stdout,
-            "Usage: zbrain view\n\nServe the embedded read-only viewer over loopback (127.0.0.1).\n\nThe viewer binds loopback only, sends strict CSP and nosniff headers,\nhas no CORS, and returns 405 for every method other than GET and HEAD.\n"
+            "Usage: zbrain view\n\nServe the embedded read-only viewer over loopback (127.0.0.1).\n\nThe viewer binds loopback only, accepts only Host 127.0.0.1:<port> or\nlocalhost:<port>, sends strict CSP and nosniff headers, has no CORS, and\nreturns 405 for every method other than GET and HEAD.\n"
         );
     }
 
@@ -1323,12 +1658,13 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let paths = Paths::resolve(Options {
+        let mut paths = Paths::resolve(Options {
             cwd: Some(dir.join("project")),
             home_dir: Some(dir.clone()),
             runtime_dir: Some(dir.join(".zbrain")),
         })
         .unwrap();
+        paths.key_dir = crate::signing::test_key_dir();
         let out = SharedOut::default();
         let err = SharedOut::default();
         let app = App {
@@ -1386,6 +1722,18 @@ mod tests {
         );
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
         parsed["id"].as_str().unwrap().to_string()
+    }
+
+    /// Answers the owner ceremony with the digest suffix the CLI will ask for.
+    fn approve_via_cli(app: &mut App, fix: &Fixture, id: &str) -> String {
+        let store = ClaimStore::with_clock(app.paths.clone(), app.clock.clone());
+        let prepare = store.approve_challenge_prepare("research", id).unwrap();
+        let suffix = crate::approval::action_digest_suffix(
+            &crate::approval::compute_challenge_action_digest(&prepare),
+        )
+        .to_string();
+        app.prompt = PromptSource::Scripted(vec![suffix]);
+        run_ok(app, fix, &["claim", "approve", id])
     }
 
     #[test]
@@ -1447,7 +1795,7 @@ mod tests {
         assert_eq!(parsed["deduped"], false);
 
         let id = draft_id(&mut app, &fix, "CLI Claim", "Claim body\n");
-        let out = run_ok(&mut app, &fix, &["claim", "approve", &id]);
+        let out = approve_via_cli(&mut app, &fix, &id);
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(parsed["status"], "approved");
         assert_eq!(parsed["index_fresh"], false);
@@ -1458,8 +1806,14 @@ mod tests {
         let (mut app, fix) = fixture();
         setup_research(&mut app, &fix);
         let id = draft_id(&mut app, &fix, "Original", "Original body\n");
-        run_ok(&mut app, &fix, &["claim", "approve", &id]);
-        assert!(run(&mut app, &fix, &["claim", "approve", &id]).is_err());
+        approve_via_cli(&mut app, &fix, &id);
+        app.prompt = PromptSource::Scripted(Vec::new());
+        let err = run(&mut app, &fix, &["claim", "approve", &id]).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("only draft claims can be approved"),
+            "{err}"
+        );
 
         app.stdin = Box::new(Cursor::new(b"Replacement body\n".to_vec()));
         let out = run_ok(
@@ -1481,7 +1835,7 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
-        run_ok(&mut app, &fix, &["claim", "approve", &replacement]);
+        approve_via_cli(&mut app, &fix, &replacement);
         run_ok(
             &mut app,
             &fix,
@@ -1497,11 +1851,23 @@ mod tests {
     }
 
     #[test]
+    fn claim_approve_refuses_wrong_digest() {
+        let (mut app, fix) = fixture();
+        setup_research(&mut app, &fix);
+        let id = draft_id(&mut app, &fix, "Wrong Digest", "wrong digest body\n");
+        app.prompt = PromptSource::Scripted(vec!["0000000000000000".to_string()]);
+        let err = run(&mut app, &fix, &["claim", "approve", &id]).unwrap_err();
+        assert!(err.to_string().contains("digest suffix mismatch"), "{err}");
+        let store = ClaimStore::new(app.paths.clone());
+        assert_eq!(store.read("research", &id).unwrap().status, "draft");
+    }
+
+    #[test]
     fn reindex_and_ask_ready() {
         let (mut app, fix) = fixture();
         setup_research(&mut app, &fix);
         let id = draft_id(&mut app, &fix, "Trusted Ask", "local trusted answer\n");
-        run_ok(&mut app, &fix, &["claim", "approve", &id]);
+        approve_via_cli(&mut app, &fix, &id);
         let out = run_ok(&mut app, &fix, &["reindex"]);
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(parsed["schema_version"], 1);
@@ -1744,7 +2110,7 @@ mod tests {
         let (mut app, fix) = fixture();
         setup_research(&mut app, &fix);
         let id = draft_id(&mut app, &fix, "Approved Catalog", "catalog body\n");
-        run_ok(&mut app, &fix, &["claim", "approve", &id]);
+        approve_via_cli(&mut app, &fix, &id);
         draft_id(&mut app, &fix, "Draft Catalog", "draft body\n");
         run_ok(&mut app, &fix, &["reindex"]);
         let out = run_ok(&mut app, &fix, &["status"]);

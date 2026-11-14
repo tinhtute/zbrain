@@ -1,7 +1,8 @@
 // Owner-ceremony terminal input (port of internal/cli approvalLineReader).
-// The grant walk reads confirmations from an interactive TTY without echo;
-// a piped real stdin fails closed so the ceremony cannot be scripted. Tests
-// inject a scripted prompt instead of a real terminal.
+// The approval walk (`approval grant` and `claim approve`) reads confirmations
+// from an interactive TTY without echo; a piped real stdin fails closed so the
+// ceremony cannot be scripted. Tests inject a scripted prompt instead of a
+// real terminal.
 
 use std::io;
 
@@ -22,7 +23,7 @@ impl StdinPrompt {
         // SAFETY: isatty takes a bare fd and performs no memory access.
         if unsafe { libc::isatty(0) } != 1 {
             return Err(io::Error::other(
-                "approval grant requires an interactive terminal (TTY)",
+                "owner approval requires an interactive terminal (TTY)",
             ));
         }
         Ok(Self)
@@ -76,7 +77,7 @@ mod tests {
         };
         assert!(
             err.to_string()
-                .contains("approval grant requires an interactive terminal"),
+                .contains("owner approval requires an interactive terminal"),
             "{err}"
         );
     }

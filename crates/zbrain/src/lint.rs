@@ -25,7 +25,7 @@ pub fn structural_findings_at(
     let _lock = crate::coordination::acquire_workspace_lock(paths, workspace, false)
         .map_err(crate::claims::message)?;
 
-    let scan = ClaimStore::new(paths.clone()).scan_workspace_for_trust(workspace)?;
+    let scan = ClaimStore::new(paths.clone()).scan_workspace(workspace)?;
     let mut claim_ids: HashSet<String> = HashSet::new();
     let mut cited_evidence: HashSet<String> = HashSet::new();
     for claim in &scan.claims {
@@ -71,7 +71,8 @@ pub fn structural_findings_at(
         }
         if claim.status == CLAIM_STATUS_APPROVED && !claim.stale_after.is_empty() {
             if let Ok(stale_after) = crate::clock::parse_rfc3339(&claim.stale_after) {
-                if stale_after < now {
+                // Same boundary as `ask`: stale at or after `stale_after`.
+                if stale_after <= now {
                     findings.push(format!(
                         "claim {} stale_after {} is in the past",
                         claim.id, claim.stale_after
@@ -79,6 +80,13 @@ pub fn structural_findings_at(
                 }
             }
         }
+    }
+
+    for invalid in &scan.invalid {
+        findings.push(format!(
+            "claim {} is invalid: {}",
+            invalid.path, invalid.error
+        ));
     }
 
     let (evidence_ids, sha_by_id) = list_evidence_snapshots(paths, workspace)?;
@@ -169,12 +177,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("zbrain-lint-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let paths = Paths::resolve(Options {
+        let mut paths = Paths::resolve(Options {
             cwd: Some(dir.clone()),
             home_dir: Some(dir.clone()),
             runtime_dir: Some(dir.join(".zbrain")),
         })
         .unwrap();
+        paths.key_dir = crate::signing::test_key_dir();
         ensure_config(&paths.config_file).unwrap();
         let clock = FixedClock::new(Utc.with_ymd_and_hms(2026, 7, 30, 9, 0, 0).unwrap());
         crate::workspace::create_workspace(&paths, "research", &clock).unwrap();
@@ -331,6 +340,62 @@ mod tests {
             joined.contains(&format!(
                 "claim {} stale_after 2020-01-01T00:00:00Z is in the past",
                 draft.id
+            )),
+            "{findings:?}"
+        );
+        // Boundary: `ask` treats a claim as stale at the exact instant, so
+        // doctor must flag it at that instant too.
+        let at_boundary = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let findings = structural_findings_at(&paths, "research", at_boundary).unwrap();
+        assert!(
+            findings.iter().any(|f| f.contains("stale_after")),
+            "{findings:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn structural_findings_report_tampered_approved_claim() {
+        let (dir, paths, clock) = fixture("tampered");
+        let store =
+            crate::claims::ClaimStore::with_clock(paths.clone(), std::sync::Arc::new(clock));
+        let draft = store.write_draft("research", valid_owner_claim()).unwrap();
+        let approved = store.approve("research", &draft.id).unwrap();
+        assert_eq!(approved.status, "approved");
+
+        // A draft that cites the approved claim as support: while the claim is
+        // trusted the id resolves, so lint has nothing to report about it.
+        let mut citing = valid_owner_claim();
+        citing.id = "clm_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into();
+        citing.supporting_claim_ids = vec![approved.id.clone()];
+        store.write_draft("research", citing).unwrap();
+        let clean = structural_findings(&paths, "research").unwrap();
+        assert!(
+            !clean.join("\n").contains("references missing"),
+            "{clean:?}"
+        );
+
+        // Tamper the approved body without recomputing the digest (repro 08).
+        let path = paths
+            .workspaces_dir
+            .join("research/wiki")
+            .join(&approved.path);
+        let contents = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, contents.replace("Body", "Tampered body")).unwrap();
+
+        let findings = structural_findings(&paths, "research").unwrap();
+        let joined = findings.join("\n");
+        assert!(
+            joined.contains(&format!(
+                "claim {} is invalid: verification digest mismatch",
+                approved.path
+            )),
+            "{findings:?}"
+        );
+        assert!(
+            joined.contains(&format!(
+                "supporting_claim_ids references missing {}",
+                approved.id
             )),
             "{findings:?}"
         );

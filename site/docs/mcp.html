@@ -105,8 +105,9 @@ TTY, then verify and print the one-time token as JSON for later apply.</code></p
 
 Serve the embedded read-only viewer over loopback (127.0.0.1).
 
-The viewer binds loopback only, sends strict CSP and nosniff headers,
-has no CORS, and returns 405 for every method other than GET and HEAD.</code></pre>
+The viewer binds loopback only, accepts only Host 127.0.0.1:&lt;port&gt; or
+localhost:&lt;port&gt;, sends strict CSP and nosniff headers, has no CORS, and
+returns 405 for every method other than GET and HEAD.</code></pre>
       <p>The viewer is read-only: it only reads workspace state, and its strict header policy leaves no room for embedding or cross-origin calls.</p>
     </section>
 

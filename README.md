@@ -49,9 +49,13 @@ query outcomes.*
    snapshot and records its metadata.
 2. `claim draft` writes an OKF claim candidate. The claim body is read from
    stdin; drafts are never trusted answer material.
-3. `claim approve` validates the claim basis and referenced evidence or
-   supporting claims, then records `verified.at`, `verified.by`, and
-   `verified.digest`.
+3. `claim approve` runs the owner ceremony: the owner confirms the last 16
+   hex characters of the action digest in an interactive TTY, and the claim
+   basis and referenced evidence or supporting claims are validated before
+   `verified.at`, `verified.by`, and `verified.digest` are recorded. The
+   ceremony then signs the verified block with the owner key (`zbrain key
+   init`, once per account); an approved claim without a valid signature is
+   never trusted.
 4. `reindex` scans canonical Markdown and evidence, validates trust inputs, and
    publishes a clean or rejected disposable index without rewriting canonical
    files.
@@ -72,7 +76,18 @@ integration surfaces described in [`docs/trusted-agent-gateway-spec.md`](docs/tr
 - `zbrain approval show <challenge-id>` and `zbrain approval grant <challenge-id>`
   provide the local owner ceremony for lifecycle actions. The agent receives a
   one-time grant token; the gateway, not an HTTP endpoint, applies the mutation.
+  `zbrain claim approve` runs the same ceremony in one step: it binds the
+  challenge, walks the owner confirmation, and applies it.
 - `zbrain view` serves a read-only embedded viewer on `127.0.0.1` only.
+- `zbrain key init` creates the owner approval key (ADR 0002) at
+  `$XDG_CONFIG_HOME/zbrain-keys` (fallback `~/.config/zbrain-keys`): directory
+  `0700`, files `0600`, refusing symlinks, a path inside `ZBRAIN_HOME`, looser
+  modes, and an existing key. `zbrain key init --recover` is the loss path:
+  it prints the new key id, writes the key only when the owner types that id,
+  and retires the previous keys so their claims keep verifying. `zbrain claim
+  resign` re-signs every approved claim in one TTY ceremony, listing id, title,
+  approval time, and digest and honoring `--exclude`; claims left unsigned stay
+  untrusted.
 
 All three surfaces reuse workspace boundaries and fail-closed trust validation;
 canonical Markdown and immutable evidence remain the trust inputs.
@@ -181,6 +196,7 @@ zbrain evidence add --file <path> --origin <uri-or-path> [--media-type <type>] [
 zbrain evidence check [--workspace <name>]
 zbrain claim draft --tier <tier> --title <title> --basis <owner|evidence|derived> [--evidence <id>]... [--support <id>]... [--conflicts-with <id>]... [--workspace <name>]
 zbrain claim approve <id> [--workspace <name>]
+zbrain claim resign [--workspace <name>] [--exclude <id>]...
 zbrain claim supersede <id> --tier <tier> --title <title> --basis <owner|evidence|derived> [--evidence <id>]... [--support <id>]... [--conflicts-with <id>]... [--workspace <name>]
 zbrain claim revoke <id> --reason <text> [--workspace <name>]
 zbrain migrate okf [--workspace <name>]
@@ -192,6 +208,7 @@ zbrain mcp serve
 zbrain view
 zbrain approval show <challenge-id>
 zbrain approval grant <challenge-id>
+zbrain key init
 zbrain version
 ```
 
@@ -200,6 +217,7 @@ Create an isolated workspace and capture evidence:
 ```bash
 export ZBRAIN_HOME=/tmp/zbrain-dev
 cargo run -q -p zbrain -- setup
+cargo run -q -p zbrain -- key init
 cargo run -q -p zbrain -- workspace create research
 cargo run -q -p zbrain -- workspace current
 cargo run -q -p zbrain -- evidence add \
@@ -218,6 +236,8 @@ claim_json=$(printf 'The local source is authoritative.\n' | \
     --basis owner)
 claim_id=$(printf '%s' "$claim_json" | python3 -c \
   'import json,sys; print(json.load(sys.stdin)["id"])')
+# The owner ceremony prompts on the terminal: type the last 16 hex characters
+# of the printed action digest. A piped caller is refused.
 cargo run -q -p zbrain -- claim approve "$claim_id"
 cargo run -q -p zbrain -- reindex
 cargo run -q -p zbrain -- status

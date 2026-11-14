@@ -61,6 +61,10 @@ zbrain &lt;command&gt; --help</code></pre>
           <p class="specimen__desc"><code>Usage:</code><br><code>zbrain claim draft --tier &lt;tier&gt; --title &lt;title&gt; --basis &lt;owner|evidence|derived&gt; [--evidence &lt;id&gt;]... [--support &lt;id&gt;]... [--conflicts-with &lt;id&gt;]... [--workspace &lt;name&gt;]</code><br><code>zbrain claim approve &lt;id&gt; [--workspace &lt;name&gt;]</code><br><code>zbrain claim supersede &lt;id&gt; --tier &lt;tier&gt; --title &lt;title&gt; --basis &lt;owner|evidence|derived&gt; [--evidence &lt;id&gt;]... [--support &lt;id&gt;]... [--conflicts-with &lt;id&gt;]... [--workspace &lt;name&gt;]</code><br><code>zbrain claim revoke &lt;id&gt; --reason &lt;text&gt; [--workspace &lt;name&gt;]</code><br>Manage the four-state OKF claim lifecycle.</p>
         </li>
         <li class="specimen__item">
+          <p class="specimen__term">claim approve</p>
+          <p class="specimen__desc"><code>Usage: zbrain claim approve &lt;id&gt; [--workspace &lt;name&gt;]</code><br>Promote a valid draft claim through the owner ceremony: confirm the last 16 hex characters of the action digest in an interactive TTY.</p>
+        </li>
+        <li class="specimen__item">
           <p class="specimen__term">migrate</p>
           <p class="specimen__desc"><code>Usage: zbrain migrate okf [--workspace &lt;name&gt;]</code><br>Convert legacy zbrain claim files to OKF concepts.</p>
         </li>
@@ -108,7 +112,7 @@ zbrain &lt;command&gt; --help</code></pre>
         </li>
         <li class="specimen__item">
           <p class="specimen__term">view</p>
-          <p class="specimen__desc"><code>Usage: zbrain view</code><br>Serve the embedded read-only viewer over loopback (127.0.0.1). The viewer binds loopback only, sends strict CSP and nosniff headers, has no CORS, and returns 405 for every method other than GET and HEAD.</p>
+          <p class="specimen__desc"><code>Usage: zbrain view</code><br>Serve the embedded read-only viewer over loopback (127.0.0.1). The viewer binds loopback only, accepts only Host 127.0.0.1:&lt;port&gt; or localhost:&lt;port&gt;, sends strict CSP and nosniff headers, has no CORS, and returns 405 for every method other than GET and HEAD.</p>
         </li>
         <li class="specimen__item">
           <p class="specimen__term">approval</p>

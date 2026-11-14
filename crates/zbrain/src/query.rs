@@ -2,20 +2,21 @@
 //! (ask), canonical index binding, contradiction surfacing, temporal recall,
 //! and hybrid (RRF) retrieval over the loopback embedding sidecar.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::boundary::{resolve_workspace_path, safe_relative_path, validate_workspace};
 use crate::claims::{
-    parse_claim_markdown, verify_claim_digest, Claim, ClaimSource, ClaimStore, Contradiction,
+    claim_verification_digest, parse_claim_markdown, verify_claim_digest, Claim, ClaimSource,
+    ClaimStore, Contradiction,
 };
 use crate::coordination::{
     acquire_workspace_lock, run_workspace_generation_test_hook,
     WORKSPACE_GENERATION_HOOK_TRUSTED_QUERY_AFTER_LOCKING,
 };
-use crate::embedder::EmbeddingStore;
+use crate::embedder::{embedding_text, shares_meaningful_token, EmbeddingStore};
 use crate::evidence::{validate_claim_evidence, EvidenceValidator};
 use crate::index::{IndexError, IndexStore, IndexedClaim, SearchOptions};
 use crate::manifest::TrustInputManifest;
@@ -228,25 +229,25 @@ pub fn trusted_query(
             fresh: true,
         });
     }
+    let trusted_statuses: Vec<String> = if temporal.as_of.is_some() {
+        vec![
+            crate::claims::CLAIM_STATUS_APPROVED.into(),
+            crate::claims::CLAIM_STATUS_SUPERSEDED.into(),
+            crate::claims::CLAIM_STATUS_REVOKED.into(),
+        ]
+    } else {
+        vec![crate::claims::CLAIM_STATUS_APPROVED.into()]
+    };
     for workspace in &workspaces {
         let manifest = manifests
             .get(workspace)
             .cloned()
             .expect("manifest captured for workspace");
-        let trusted_statuses: Vec<String> = if temporal.as_of.is_some() {
-            vec![
-                crate::claims::CLAIM_STATUS_APPROVED.into(),
-                crate::claims::CLAIM_STATUS_SUPERSEDED.into(),
-                crate::claims::CLAIM_STATUS_REVOKED.into(),
-            ]
-        } else {
-            vec![crate::claims::CLAIM_STATUS_APPROVED.into()]
-        };
         let approved = idx.search_unlocked_internal(
             workspace,
             SearchOptions {
                 query: options.query.clone(),
-                statuses: trusted_statuses,
+                statuses: trusted_statuses.clone(),
                 limit,
             },
             false,
@@ -258,17 +259,10 @@ pub fn trusted_query(
                 merge_vector_results(paths, &idx, workspace, approved, &options.query, limit)?;
         }
         for claim in approved {
-            validate_indexed_claim_binding_internal(
-                paths,
-                workspace,
-                &claim,
-                Some(&manifest),
-                false,
-            )?;
-            let canonical = ClaimStore::new(paths.clone()).read(workspace, &claim.id)?;
-            if !match_temporal_claim(&canonical, &temporal) {
+            let Some(canonical) = trusted_claim_at(paths, workspace, &manifest, &claim, &temporal)?
+            else {
                 continue;
-            }
+            };
             let mut query_claim = to_query_claim(workspace, &claim);
             query_claim.sources = if canonical.sources.is_empty() {
                 None
@@ -339,7 +333,14 @@ pub fn trusted_query(
     if let Some(candidates) = response.promotion_candidates.as_mut() {
         sort_query_claims(candidates);
     }
-    let conflicts = find_query_conflicts(paths, response.claims.as_deref().unwrap_or(&[]))?;
+    let conflicts = find_query_conflicts(
+        paths,
+        &idx,
+        &manifests,
+        &trusted_statuses,
+        response.claims.as_deref().unwrap_or(&[]),
+        &temporal,
+    )?;
     let blocked = !conflicts.is_empty();
     response.conflicts = conflicts;
     if blocked {
@@ -401,8 +402,14 @@ fn query_contradictions(contradictions: &[Contradiction]) -> Vec<QueryContradict
 
 /// mergeVectorResults performs hybrid retrieval: it searches the embedding
 /// sidecar for vector matches and merges them with the lexical results. The
-/// original approved slice is returned unchanged when the sidecar is missing
-/// or has no vectors.
+/// original approved slice is returned unchanged when the sidecar is missing,
+/// has no vectors, or holds no vector that shares a meaningful token with the
+/// query.
+///
+/// A vector only counts as evidence when it shares a significant token with the
+/// query. loopback-v1 scores unrelated text above zero by hash collision and
+/// stopword overlap, so ranking alone would let a miss answer "ready"; the
+/// token gate is what keeps readiness fail-closed.
 fn merge_vector_results(
     paths: &Paths,
     idx: &IndexStore,
@@ -432,7 +439,21 @@ fn merge_vector_results(
     let ordered: Vec<IndexedClaim> = vec_ids
         .iter()
         .filter_map(|id| by_id.get(id).cloned())
+        .filter(|claim| {
+            shares_meaningful_token(
+                query,
+                &embedding_text(
+                    &claim.title,
+                    &claim.description,
+                    &claim.indexed_tags,
+                    &claim.indexed_body,
+                ),
+            )
+        })
         .collect();
+    if ordered.is_empty() {
+        return Ok(approved);
+    }
     Ok(interleave_claims(approved, ordered, limit))
 }
 
@@ -615,6 +636,12 @@ fn validate_indexed_claim_binding_internal(
             indexed.id
         ))
     })?;
+    crate::signing::verify_claim_signature_at(paths, &canonical).map_err(|err| {
+        IndexError::Message(format!(
+            "approved claim {:?} approval signature failed: {err}",
+            indexed.id
+        ))
+    })?;
     if canonical.evidence_ids.is_empty() && canonical.supporting_claim_ids.is_empty() {
         return Ok(());
     }
@@ -677,6 +704,138 @@ fn validate_indexed_claim_binding_internal(
                     indexed.id
                 ))
             })?;
+    }
+    Ok(())
+}
+
+/// Verifies a superseded or revoked claim as it stood when it was approved.
+///
+/// The lifecycle appends the terminal supersede/revoke transition after the
+/// approval digest was recorded, so the recorded digest covers the claim
+/// without that transition. Rebuild the approved view, recompute the digest,
+/// run the same evidence-closure check the approved path uses, and verify the
+/// supporting-claim closure at the as-of instant. Callers fail closed (drop
+/// the row) when this returns an error.
+fn verify_historical_claim(
+    paths: &Paths,
+    workspace: &str,
+    canonical: &Claim,
+    as_of: DateTime<Utc>,
+) -> Result<(), String> {
+    verify_claim_trust_at(paths, workspace, canonical, as_of)?;
+    let mut visiting = HashSet::new();
+    visiting.insert(canonical.id.clone());
+    let mut verified = HashSet::new();
+    verify_support_closure(
+        paths,
+        workspace,
+        canonical,
+        as_of,
+        &mut visiting,
+        &mut verified,
+    )
+}
+
+/// Verifies one claim as trusted at `as_of`: it was active then, its digest
+/// covers the approved content, and its evidence closure verifies.
+fn verify_claim_trust_at(
+    paths: &Paths,
+    workspace: &str,
+    claim: &Claim,
+    as_of: DateTime<Utc>,
+) -> Result<(), String> {
+    let filter = TemporalFilter {
+        after: None,
+        before: None,
+        as_of: Some(as_of),
+        now: as_of,
+    };
+    if !match_temporal_claim(claim, &filter) {
+        return Err(format!("claim {:?} was not active at as_of", claim.id));
+    }
+    if claim.verified_digest.trim().is_empty() {
+        return Err(format!(
+            "claim {:?} is missing its verification digest",
+            claim.id
+        ));
+    }
+    let mut approved = claim.clone();
+    if claim.status != crate::claims::CLAIM_STATUS_APPROVED {
+        let Some(terminal) = claim.transitions.last() else {
+            return Err(format!(
+                "claim {:?} is missing its lifecycle transition",
+                claim.id
+            ));
+        };
+        if terminal.kind != crate::claims::CLAIM_TRANSITION_SUPERSEDE
+            && terminal.kind != crate::claims::CLAIM_TRANSITION_REVOKE
+        {
+            return Err(format!(
+                "claim {:?} terminal transition {:?} is not supersede or revoke",
+                claim.id, terminal.kind
+            ));
+        }
+        if terminal.prior_verification_digest != claim.verified_digest {
+            return Err(format!(
+                "claim {:?} terminal transition does not bind the digest",
+                claim.id
+            ));
+        }
+        approved.status = crate::claims::CLAIM_STATUS_APPROVED.to_string();
+        approved.transitions.pop();
+    }
+    let digest = claim_verification_digest(&approved)
+        .map_err(|err| format!("compute verification digest for {:?}: {err}", claim.id))?;
+    if digest != claim.verified_digest {
+        return Err(format!("claim {:?} verification digest mismatch", claim.id));
+    }
+    crate::signing::verify_claim_signature_at(paths, claim)
+        .map_err(|err| format!("claim {:?} approval signature: {err}", claim.id))?;
+    if !approved.evidence_ids.is_empty() {
+        let mut evidence_validator =
+            EvidenceValidator::new(paths.clone(), workspace).map_err(|err| {
+                format!(
+                    "evidence validator for {:?} is unavailable: {err}",
+                    claim.id
+                )
+            })?;
+        validate_claim_evidence(&mut evidence_validator, &approved)
+            .map_err(|err| format!("evidence validation for {:?} failed: {err}", claim.id))?;
+    }
+    Ok(())
+}
+
+/// Walks the supporting-claim closure at the as-of instant: every support must
+/// have been trusted then, with a verifiable digest and evidence closure.
+fn verify_support_closure(
+    paths: &Paths,
+    workspace: &str,
+    claim: &Claim,
+    as_of: DateTime<Utc>,
+    visiting: &mut HashSet<String>,
+    verified: &mut HashSet<String>,
+) -> Result<(), String> {
+    let mut seen = HashSet::new();
+    for id in &claim.supporting_claim_ids {
+        if !seen.insert(id.clone()) {
+            return Err(format!(
+                "claim {:?} has duplicate supporting claim {id:?}",
+                claim.id
+            ));
+        }
+        if verified.contains(id) {
+            continue;
+        }
+        if !visiting.insert(id.clone()) {
+            return Err(format!("supporting claim cycle at {id:?}"));
+        }
+        let support = ClaimStore::new(paths.clone())
+            .read(workspace, id)
+            .map_err(|err| format!("load supporting claim {id:?}: {err}"))?;
+        verify_claim_trust_at(paths, workspace, &support, as_of)?;
+        verify_support_closure(paths, workspace, &support, as_of, visiting, verified)?;
+        visiting.remove(id);
+        verified.insert(id.clone());
     }
     Ok(())
 }
@@ -752,11 +911,72 @@ pub(crate) fn sort_query_claims(claims: &mut [QueryClaim]) {
     });
 }
 
+/// Loads the canonical claim behind an indexed row and applies the trusted
+/// query's per-claim rule: the row must bind to the published manifest, the
+/// canonical claim must verify through the approved read path, and it must be
+/// trusted at the query instant. Returns `None` when the row is not trusted
+/// now. The returned page and the declared conflict targets share this rule,
+/// so an unverified or unsigned target can neither block nor unblock.
+fn trusted_claim_at(
+    paths: &Paths,
+    workspace: &str,
+    manifest: &TrustInputManifest,
+    indexed: &IndexedClaim,
+    temporal: &TemporalFilter,
+) -> Result<Option<Claim>, IndexError> {
+    validate_indexed_claim_binding_internal(paths, workspace, indexed, Some(manifest), false)?;
+    let canonical = ClaimStore::new(paths.clone()).read(workspace, &indexed.id)?;
+    if !match_temporal_claim(&canonical, temporal) {
+        return Ok(None);
+    }
+    // Without `as_of` the query instant is now; apply the same stale_after
+    // rule the `as_of` path applies so a stale claim is not trusted.
+    if temporal.as_of.is_none() && claim_stale_at(&canonical, temporal.now) {
+        return Ok(None);
+    }
+    if let Some(as_of) = temporal.as_of {
+        let terminal = canonical.status == crate::claims::CLAIM_STATUS_SUPERSEDED
+            || canonical.status == crate::claims::CLAIM_STATUS_REVOKED;
+        if terminal && verify_historical_claim(paths, workspace, &canonical, as_of).is_err() {
+            return Ok(None);
+        }
+    }
+    Ok(Some(canonical))
+}
+
+fn record_conflict(
+    conflicts: &mut Vec<QueryConflict>,
+    seen: &mut HashSet<String>,
+    workspace: &str,
+    left: &str,
+    right: &str,
+) {
+    let mut ids = vec![left.to_string(), right.to_string()];
+    ids.sort();
+    let key = format!("{workspace}:{}:{}", ids[0], ids[1]);
+    if !seen.insert(key) {
+        return;
+    }
+    conflicts.push(QueryConflict {
+        workspace: workspace.to_string(),
+        claim_ids: ids,
+    });
+}
+
+/// Collects the declared conflicts of every returned claim. A target inside
+/// the returned page is already trusted by the main loop; a target outside it
+/// is looked up by id in the same workspace and must pass the same trust rule
+/// before it blocks. Conflicts are declared one-way in the claim format, so
+/// only the returned claim's declarations are checked.
 fn find_query_conflicts(
     paths: &Paths,
+    idx: &IndexStore,
+    manifests: &HashMap<String, TrustInputManifest>,
+    trusted_statuses: &[String],
     claims: &[QueryClaim],
+    temporal: &TemporalFilter,
 ) -> Result<Vec<QueryConflict>, IndexError> {
-    let mut by_workspace: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+    let mut by_workspace: HashMap<String, HashSet<String>> = HashMap::new();
     for claim in claims {
         by_workspace
             .entry(claim.workspace.clone())
@@ -764,7 +984,9 @@ fn find_query_conflicts(
             .insert(claim.id.clone());
     }
     let mut conflicts: Vec<QueryConflict> = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut outside: HashMap<String, BTreeSet<String>> = HashMap::new();
+    let mut pairs: Vec<(String, String, String)> = Vec::new();
     for query_claim in claims {
         let claim = read_claim_by_path(paths, &query_claim.workspace, &query_claim.path)?;
         if claim.id != query_claim.id {
@@ -774,22 +996,51 @@ fn find_query_conflicts(
             )));
         }
         for other in &claim.conflicts_with {
-            let Some(scope) = by_workspace.get(&query_claim.workspace) else {
-                continue;
-            };
-            if !scope.contains(other) {
+            let in_page = by_workspace
+                .get(&query_claim.workspace)
+                .is_some_and(|scope| scope.contains(other));
+            if in_page {
+                record_conflict(
+                    &mut conflicts,
+                    &mut seen,
+                    &query_claim.workspace,
+                    &query_claim.id,
+                    other,
+                );
                 continue;
             }
-            let mut ids = vec![query_claim.id.clone(), other.clone()];
-            ids.sort();
-            let key = format!("{}:{}:{}", query_claim.workspace, ids[0], ids[1]);
-            if !seen.insert(key) {
-                continue;
+            outside
+                .entry(query_claim.workspace.clone())
+                .or_default()
+                .insert(other.clone());
+            pairs.push((
+                query_claim.workspace.clone(),
+                query_claim.id.clone(),
+                other.clone(),
+            ));
+        }
+    }
+    if outside.is_empty() {
+        return Ok(conflicts);
+    }
+    let mut trusted: HashSet<(String, String)> = HashSet::new();
+    for (workspace, ids) in outside {
+        let Some(manifest) = manifests.get(&workspace) else {
+            return Err(IndexError::Message(format!(
+                "workspace {workspace:?} has no published trust manifest"
+            )));
+        };
+        let ids: Vec<String> = ids.into_iter().collect();
+        let rows = idx.claims_by_ids_with_statuses_unlocked(&workspace, &ids, trusted_statuses)?;
+        for row in rows {
+            if trusted_claim_at(paths, &workspace, manifest, &row, temporal)?.is_some() {
+                trusted.insert((workspace.clone(), row.id));
             }
-            conflicts.push(QueryConflict {
-                workspace: query_claim.workspace.clone(),
-                claim_ids: ids,
-            });
+        }
+    }
+    for (workspace, declaring, target) in pairs {
+        if trusted.contains(&(workspace.clone(), target.clone())) {
+            record_conflict(&mut conflicts, &mut seen, &workspace, &declaring, &target);
         }
     }
     Ok(conflicts)
@@ -812,11 +1063,25 @@ fn read_claim_by_path(paths: &Paths, workspace: &str, relative: &str) -> Result<
         .map_err(|err| IndexError::Message(err.to_string()))
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 struct TemporalFilter {
     after: Option<DateTime<Utc>>,
     before: Option<DateTime<Utc>>,
     as_of: Option<DateTime<Utc>>,
+    /// The query instant used for `stale_after` when `as_of` is absent.
+    now: DateTime<Utc>,
+}
+
+/// A claim is stale at `at` once its `stale_after` is at or before `at`. An
+/// unparseable `stale_after` fails closed as stale.
+fn claim_stale_at(canonical: &Claim, at: DateTime<Utc>) -> bool {
+    if canonical.stale_after.is_empty() {
+        return false;
+    }
+    match parse_rfc3339(&canonical.stale_after) {
+        Ok(stale_time) => stale_time <= at,
+        Err(_) => true,
+    }
 }
 
 fn parse_rfc3339(value: &str) -> Result<DateTime<Utc>, IndexError> {
@@ -962,7 +1227,12 @@ fn parse_rfc3339_go(value: &str) -> Result<DateTime<Utc>, String> {
 }
 
 fn parse_temporal_options(options: &TrustedQueryOptions) -> Result<TemporalFilter, IndexError> {
-    let mut filter = TemporalFilter::default();
+    let mut filter = TemporalFilter {
+        after: None,
+        before: None,
+        as_of: None,
+        now: crate::clock::Clock::now(&crate::clock::SystemClock),
+    };
     if !options.after.is_empty() {
         filter.after = Some(parse_rfc3339_go(&options.after).map_err(|err| {
             IndexError::Message(format!(
@@ -1017,13 +1287,8 @@ fn match_temporal_claim(canonical: &Claim, filter: &TemporalFilter) -> bool {
         if claim_time > as_of {
             return false;
         }
-        if !canonical.stale_after.is_empty() {
-            let Ok(stale_time) = parse_rfc3339(&canonical.stale_after) else {
-                return false;
-            };
-            if stale_time <= as_of {
-                return false;
-            }
+        if claim_stale_at(canonical, as_of) {
+            return false;
         }
         if canonical.status == crate::claims::CLAIM_STATUS_SUPERSEDED
             || canonical.status == crate::claims::CLAIM_STATUS_REVOKED
@@ -1089,12 +1354,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("zbrain-query-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let paths = Paths::resolve(Options {
+        let mut paths = Paths::resolve(Options {
             cwd: Some(dir.join("project")),
             home_dir: Some(dir.clone()),
             runtime_dir: Some(dir.join(".zbrain")),
         })
         .unwrap();
+        paths.key_dir = crate::signing::test_key_dir();
         crate::config::ensure_config(&paths.config_file).unwrap();
         crate::workspace::create_workspace(&paths, "research", &FixedClock::new(fixed_query_now()))
             .unwrap();
@@ -1140,6 +1406,7 @@ mod tests {
         claim.verified_by = "owner".into();
         claim.verified_digest = String::new();
         claim.verified_digest = claim_verification_digest(&claim).unwrap();
+        crate::signing::sign_test_claim(&mut claim);
         claim
     }
 
@@ -2912,6 +3179,70 @@ mod tests {
             "withInclude claims = {:?}",
             with_include.claims
         );
+        let _ = std::fs::remove_dir_all(&_dir);
+    }
+
+    /// The verification digest blanks `verified.*`, so a flipped signature
+    /// keeps the digest intact. Only the signature check in the canonical
+    /// binding rejects it, and the query must fail closed rather than serve
+    /// the claim.
+    #[test]
+    fn canonical_index_binding_rejects_a_bad_signature() {
+        let (_dir, paths) = query_test_paths("binding-bad-signature");
+        let claim_store = query_claim_store(&paths);
+        let id = "clm_99999999999999999999999999999999";
+        let mut claim = query_claim(id, "Signed binding marker", CLAIM_BASIS_OWNER);
+        claim.body = "signed binding query marker\n".into();
+        claim_store.write_draft("research", claim).unwrap();
+        claim_store.approve("research", id).unwrap();
+        store(&paths).rebuild("research").unwrap();
+        let indexed = store(&paths)
+            .search(
+                "research",
+                search_opts("signed binding", vec![CLAIM_STATUS_APPROVED], 10),
+            )
+            .unwrap();
+        assert_eq!(indexed.len(), 1);
+
+        let path = paths
+            .workspaces_dir
+            .join("research/wiki/projects")
+            .join(format!("{id}.md"));
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let marker = "    sig: ";
+        let start = contents
+            .find(marker)
+            .expect("approved claim carries a signature")
+            + marker.len();
+        let end = start + contents[start..].find('\n').unwrap();
+        let mut signature: Vec<u8> = contents[start..end].bytes().collect();
+        signature[0] = if signature[0] == b'A' { b'B' } else { b'A' };
+        std::fs::write(
+            &path,
+            format!(
+                "{}{}{}",
+                &contents[..start],
+                String::from_utf8(signature).unwrap(),
+                &contents[end..]
+            ),
+        )
+        .unwrap();
+        let manifest = build_trust_input_manifest(&paths, "research").unwrap();
+
+        let err = validate_indexed_claim_binding(&paths, "research", &indexed[0], Some(&manifest))
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("approval signature"), "{message}");
+        assert!(message.contains(id), "{message}");
+        assert!(trusted_query(
+            &paths,
+            TrustedQueryOptions {
+                query: "signed binding".into(),
+                limit: 10,
+                ..TrustedQueryOptions::default()
+            },
+        )
+        .is_err());
         let _ = std::fs::remove_dir_all(&_dir);
     }
 }

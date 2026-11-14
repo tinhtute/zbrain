@@ -61,7 +61,8 @@ printf 'trusted acceptance answer\\n' | \\
     --tier projects \\
     --title 'Acceptance claim' \\
     --basis owner
-# Copy the returned id into the next command.
+# Copy the returned id into the next command. Approve runs the owner ceremony:
+# type the last 16 hex characters of the printed action digest on the terminal.
 cargo run -q -p zbrain -- claim approve <claim-id>
 cargo run -q -p zbrain -- reindex
 cargo run -q -p zbrain -- status
@@ -150,7 +151,9 @@ serves embedded HTML/CSS/JS, and escapes Markdown and raw evidence before
 rendering. Check responses for the strict CSP
 `default-src 'self'; script-src 'none'; object-src 'none'`,
 `X-Content-Type-Options: nosniff`, and no `Access-Control-*` headers. Every method other than `GET` and `HEAD` receives `405 Method Not Allowed`;
-the viewer has no mutation API.
+the viewer has no mutation API. Only `Host: 127.0.0.1:<port>` or
+`localhost:<port>` is accepted: a missing `Host` returns `400` and any other
+or repeated `Host` returns `421` with an empty body.
 
 ## Verification gates
 

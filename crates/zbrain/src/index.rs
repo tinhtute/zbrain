@@ -12,18 +12,16 @@ use serde::Serialize;
 
 use crate::boundary::{safe_relative_path, validate_workspace, BoundaryError};
 use crate::claims::{
-    is_known_claim_status, verify_claim_digest, Claim, ClaimError, ClaimStore, InvalidClaim,
-    CLAIM_STATUS_APPROVED, CLAIM_STATUS_DRAFT, OKF_CLAIM_TYPE,
+    is_known_claim_status, Claim, ClaimError, ClaimStore, InvalidClaim, CLAIM_STATUS_APPROVED,
+    CLAIM_STATUS_DRAFT, OKF_CLAIM_TYPE,
 };
 use crate::coordination::{
     acquire_workspace_lock, ensure_workspace_generation, mark_dirty_unlocked,
     read_workspace_generation, run_workspace_generation_test_hook, validated_index_paths,
     write_workspace_generation, GenerationError,
 };
-use crate::evidence::{validate_claim_evidence, EvidenceValidator};
 use crate::manifest::{build_trust_input_manifest, TrustInputManifest};
 use crate::paths::{ensure_directory_mode, set_permissions, Paths, DERIVED_INDEX_MODE};
-use crate::trust::TrustValidator;
 use crate::workspace::WIKI_TIERS;
 use crate::{claims, index_state, transition};
 
@@ -37,6 +35,15 @@ pub enum IndexError {
     Rusqlite(rusqlite::Error),
     Claim(ClaimError),
     Message(String),
+    /// Markdown under `wiki/` that is not a claim in a wiki tier makes the
+    /// rebuild reject the index, and `reindex` alone cannot clear it.
+    /// `files` are wiki-relative paths; `other_invalid` counts the other
+    /// trust inputs the last rebuild rejected (0 before a rebuild saw them).
+    WikiMarkdown {
+        message: String,
+        files: Vec<String>,
+        other_invalid: i64,
+    },
 }
 
 impl std::fmt::Display for IndexError {
@@ -47,6 +54,7 @@ impl std::fmt::Display for IndexError {
             Self::Rusqlite(source) => write!(f, "{source}"),
             Self::Claim(source) => write!(f, "{source}"),
             Self::Message(message) => write!(f, "{message}"),
+            Self::WikiMarkdown { message, .. } => write!(f, "{message}"),
         }
     }
 }
@@ -127,6 +135,10 @@ pub struct IndexSummary {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub invalid_claims: Vec<InvalidClaimSerde>,
     pub legacy: i64,
+    /// Non-claim Markdown files under `wiki/` that made the rebuild reject
+    /// the index, each with the fix (`reindex` alone cannot clear them).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub legacy_files: Vec<InvalidClaimSerde>,
     #[serde(rename = "rebuild_state")]
     pub rebuild_state: String,
     pub manifest_digest: String,
@@ -279,6 +291,17 @@ impl IndexStore {
         self.check_fresh_unlocked_output(workspace)
     }
 
+    /// The number of trust inputs a rebuild would reject right now, counted
+    /// the way `rebuild` counts them. `None` when the scan itself fails.
+    fn current_invalid_count(&self, workspace: &str) -> Option<i64> {
+        let store = ClaimStore::new(self.paths.clone());
+        let scan = store.scan_workspace_inner(workspace, false).ok()?;
+        let (_, dependency_invalid) = store
+            .validate_trusted_claims(workspace, &scan.claims)
+            .ok()?;
+        Some((scan.invalid.len() + dependency_invalid.len() + scan.legacy_unindexed.len()) as i64)
+    }
+
     /// checkFreshUnlockedOutput validates freshness and returns the published
     /// trust-input manifest read from the index.
     pub(crate) fn check_fresh_unlocked_output(
@@ -287,6 +310,7 @@ impl IndexStore {
     ) -> Result<TrustInputManifest, IndexError> {
         validated_index_paths(&self.paths, workspace)?;
         transition::check_pending_transition_unlocked(&self.paths, workspace)?;
+        let workspace_root = validate_workspace(&self.paths, workspace)?;
         let dirty_path = self.dirty_path_unchecked(workspace);
         if dirty_path.symlink_metadata().is_ok() {
             return msg(format!(
@@ -314,6 +338,34 @@ impl IndexStore {
             ))
         })?;
         if state.status == index_state::REBUILD_STATUS_REJECTED {
+            // Name the files `reindex` cannot fix; this reads every wiki
+            // Markdown file, so it runs only on this failure path.
+            let wiki_root = workspace_root.join("wiki");
+            if let (Ok(mut non_claims), Ok(outside_tiers)) = (
+                claims::wiki_non_claim_markdown(&wiki_root),
+                claims::wiki_markdown_outside_tiers(&wiki_root),
+            ) {
+                non_claims.extend(outside_tiers);
+                non_claims.sort();
+                non_claims.dedup();
+                if !non_claims.is_empty() {
+                    // Each listed file is one rejected input; the rest are
+                    // other causes the move won't fix. Count them on the
+                    // wiki as it is now: the recorded count describes the
+                    // last rebuild and drifts once files are added or moved.
+                    let invalid_now = self
+                        .current_invalid_count(workspace)
+                        .unwrap_or(state.invalid_count);
+                    let other_invalid = invalid_now.saturating_sub(non_claims.len() as i64).max(0);
+                    return Err(wiki_markdown_error(
+                        workspace,
+                        &workspace_root,
+                        "rejected",
+                        non_claims,
+                        other_invalid,
+                    ));
+                }
+            }
             return msg(format!(
                 "workspace {workspace:?} index is rejected: {} invalid trust inputs; run zbrain reindex",
                 state.invalid_count
@@ -323,6 +375,23 @@ impl IndexStore {
             return msg(format!(
                 "workspace {workspace:?} index state is malformed: unsupported rebuild status {:?}",
                 state.status
+            ));
+        }
+        // The rebuild scans all of wiki/; files outside the tiers would make
+        // it reject the index, so a clean index is stale once one appears.
+        let outside_tiers = claims::wiki_markdown_outside_tiers(&workspace_root.join("wiki"))
+            .map_err(|err| {
+                IndexError::Message(format!(
+                    "workspace {workspace:?} index freshness check failed: {err}"
+                ))
+            })?;
+        if !outside_tiers.is_empty() {
+            return Err(wiki_markdown_error(
+                workspace,
+                &workspace_root,
+                "stale",
+                outside_tiers,
+                0,
             ));
         }
         let generation = read_workspace_generation(&self.paths, workspace).map_err(|err| {
@@ -336,7 +405,6 @@ impl IndexStore {
             ));
         }
 
-        let workspace_root = validate_workspace(&self.paths, workspace)?;
         let recorded_mtimes = read_trust_input_mtimes(&conn).map_err(|err| {
             IndexError::Message(format!(
                 "workspace {workspace:?} index freshness metadata is missing or malformed: {err}; run zbrain reindex"
@@ -400,10 +468,7 @@ impl IndexStore {
                 ))
             })?;
             if let Some(offender) = offender {
-                return msg(format!(
-                    "workspace {workspace:?} index is stale; trust input {:?} changed after index; run zbrain reindex",
-                    offender.display()
-                ));
+                return Err(stale_input_error(workspace, &workspace_root, &offender));
             }
         }
         let mut change_token_unavailable = false;
@@ -426,9 +491,10 @@ impl IndexStore {
                         "workspace {workspace:?} index manifest is stale; run zbrain reindex"
                     ));
                 };
-                return msg(format!(
-                    "workspace {workspace:?} index is stale; trust input {:?} changed after index; run zbrain reindex",
-                    workspace_root.join(slash_parts(&offender)).display()
+                return Err(stale_input_error(
+                    workspace,
+                    &workspace_root,
+                    &workspace_root.join(slash_parts(&offender)),
                 ));
             }
         }
@@ -471,10 +537,7 @@ impl IndexStore {
             if info.mtime_nsec_composed() != recorded_metadata.modified_at
                 || file_change_token(&info) != recorded_metadata.change_token
             {
-                return msg(format!(
-                    "workspace {workspace:?} index is stale; trust input {:?} changed after index; run zbrain reindex",
-                    input_path.display()
-                ));
+                return Err(stale_input_error(workspace, &workspace_root, &input_path));
             }
         }
         Ok(manifest)
@@ -518,7 +581,7 @@ impl IndexStore {
 
             let manifest_before = build_trust_input_manifest(&self.paths, workspace)?;
             let mut scan = ClaimStore::new(self.paths.clone())
-                .scan_workspace_for_trust(workspace)
+                .scan_workspace_inner(workspace, false)
                 .map_err(IndexError::from)?;
             run_workspace_generation_test_hook(
                 crate::coordination::WORKSPACE_GENERATION_HOOK_REBUILD_AFTER_SCAN,
@@ -527,8 +590,9 @@ impl IndexStore {
             if !same_trust_input_manifest(&manifest_before, &manifest) {
                 return msg("trust inputs changed during rebuild");
             }
-            let (valid_claims, dependency_invalid) =
-                validate_approved_claims_for_rebuild(&self.paths, workspace, &scan.claims)?;
+            let (valid_claims, dependency_invalid) = ClaimStore::new(self.paths.clone())
+                .validate_trusted_claims(workspace, &scan.claims)
+                .map_err(IndexError::from)?;
             scan.claims = valid_claims;
             scan.invalid.extend(dependency_invalid);
             scan.invalid.sort_by(|left, right| {
@@ -560,6 +624,14 @@ impl IndexStore {
                 invalid_count,
                 invalid_claims: scan.invalid.iter().map(InvalidClaimSerde::from).collect(),
                 legacy: scan.legacy_unindexed.len() as i64,
+                legacy_files: scan
+                    .legacy_unindexed
+                    .iter()
+                    .map(|path| InvalidClaimSerde {
+                        path: path.clone(),
+                        error: format!("not a zbrain claim; {}", claims::WIKI_MARKDOWN_FIX),
+                    })
+                    .collect(),
                 rebuild_state: rebuild_status.to_string(),
                 manifest_digest: manifest.digest.clone(),
                 rebuilt_at: rebuilt_at.clone(),
@@ -681,19 +753,43 @@ impl IndexStore {
         workspace: &str,
         ids: &[String],
     ) -> Result<Vec<IndexedClaim>, IndexError> {
-        if ids.is_empty() {
+        let statuses = [CLAIM_STATUS_APPROVED.to_string()];
+        self.claims_by_ids_with_statuses_unlocked(workspace, ids, &statuses)
+    }
+
+    /// claimsByIDsWithStatusesUnlocked returns indexed claims matching the
+    /// given IDs and statuses. IDs that are not present in the index are
+    /// ignored. The caller must already hold the workspace lock and have
+    /// validated freshness.
+    pub(crate) fn claims_by_ids_with_statuses_unlocked(
+        &self,
+        workspace: &str,
+        ids: &[String],
+        statuses: &[String],
+    ) -> Result<Vec<IndexedClaim>, IndexError> {
+        if ids.is_empty() || statuses.is_empty() {
             return Ok(Vec::new());
+        }
+        for status in statuses {
+            if !is_known_claim_status(status) {
+                return msg(format!("claim status {status:?} is not supported"));
+            }
         }
         let database_path = self.database_path(workspace)?;
         let conn = open_index(&database_path)?;
-        let placeholders = vec!["?"; ids.len()].join(",");
+        let id_placeholders = vec!["?"; ids.len()].join(",");
+        let status_placeholders = vec!["?"; statuses.len()].join(",");
         let sql = format!(
             "select id, path, tier, type, status, title, description, stale_after, tags, body, verification_digest
 from claims
-where status = ? and id in ({placeholders})"
+where status in ({status_placeholders}) and id in ({id_placeholders})"
         );
         let mut statement = conn.prepare(&sql)?;
-        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(CLAIM_STATUS_APPROVED)];
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> =
+            Vec::with_capacity(statuses.len() + ids.len());
+        for status in statuses {
+            params.push(Box::new(status.clone()));
+        }
         for id in ids {
             params.push(Box::new(id.clone()));
         }
@@ -905,6 +1001,66 @@ pub(crate) fn read_trust_directories(
         directories.push(directory);
     }
     Ok(directories)
+}
+
+/// Failure for wiki Markdown files the rebuild rejects. The text names the
+/// first file and the fix, because `reindex` alone leaves the index
+/// rejected, and counts `other_invalid` inputs so the move is not presented
+/// as the whole fix. `condition` is "stale" before a rebuild saw the files
+/// and "rejected" after.
+fn wiki_markdown_error(
+    workspace: &str,
+    workspace_root: &Path,
+    condition: &str,
+    files: Vec<String>,
+    other_invalid: i64,
+) -> IndexError {
+    let first = workspace_root
+        .join("wiki")
+        .join(slash_parts(&files[0].replace('\\', "/")));
+    let more = match files.len() {
+        1 => String::new(),
+        count => format!(" (and {} more)", count - 1),
+    };
+    let others = match other_invalid {
+        0 => String::new(),
+        1 => "; 1 other invalid trust input also blocks the index; zbrain reindex lists it"
+            .to_string(),
+        count => format!(
+            "; {count} other invalid trust inputs also block the index; zbrain reindex lists them"
+        ),
+    };
+    let message = format!(
+        "workspace {workspace:?} index is {condition}; wiki file {:?}{more} is not a zbrain claim in a wiki tier; {}{others}",
+        first.display(),
+        claims::WIKI_MARKDOWN_FIX
+    );
+    IndexError::WikiMarkdown {
+        message,
+        files,
+        other_invalid,
+    }
+}
+
+/// Failure text for a trust input that changed after the index. A non-claim
+/// Markdown file gets the actionable message instead of "run zbrain reindex",
+/// which would only publish a rejected index.
+fn stale_input_error(workspace: &str, workspace_root: &Path, input: &Path) -> IndexError {
+    if claims::is_non_claim_markdown_file(input) {
+        if let Ok(relative) = input.strip_prefix(workspace_root.join("wiki")) {
+            return wiki_markdown_error(
+                workspace,
+                workspace_root,
+                "stale",
+                vec![relative.to_string_lossy().to_string()],
+                0,
+            );
+        }
+    }
+    IndexError::Message(format!(
+        "workspace {workspace:?} index is stale; trust input {:?} changed after index; run zbrain reindex",
+        input.display()
+    ))
 }
 
 fn find_freshness_offender(
@@ -1225,56 +1381,6 @@ fn write_trust_directories(
         })?;
     }
     Ok(())
-}
-
-fn validate_approved_claims_for_rebuild(
-    paths: &Paths,
-    workspace: &str,
-    claims: &[Claim],
-) -> Result<(Vec<Claim>, Vec<InvalidClaim>), IndexError> {
-    let mut validator = TrustValidator::from_store(&ClaimStore::new(paths.clone()), workspace)
-        .map_err(IndexError::from)?;
-    let mut evidence_validator = EvidenceValidator::new(paths.clone(), workspace)
-        .map_err(|err| IndexError::Message(err.to_string()))?;
-    let mut valid_claims = Vec::with_capacity(claims.len());
-    let mut invalid_claims: Vec<InvalidClaim> = Vec::new();
-    for claim in claims {
-        if claim.status != CLAIM_STATUS_APPROVED {
-            valid_claims.push(claim.clone());
-            continue;
-        }
-        if let Err(err) = verify_claim_digest(claim) {
-            invalid_claims.push(InvalidClaim {
-                path: claim.path.clone(),
-                error: err.to_string(),
-            });
-            continue;
-        }
-        if let Err(err) = validate_claim_evidence(&mut evidence_validator, claim) {
-            invalid_claims.push(InvalidClaim {
-                path: claim.path.clone(),
-                error: err.to_string(),
-            });
-            continue;
-        }
-        let result = validator.validate_claim_with_support(claim, &mut |support: &Claim| {
-            validate_claim_evidence(&mut evidence_validator, support).map_err(|err| err.to_string())
-        });
-        if let Err(err) = result {
-            invalid_claims.push(InvalidClaim {
-                path: claim.path.clone(),
-                error: err.to_string(),
-            });
-            continue;
-        }
-        valid_claims.push(claim.clone());
-    }
-    invalid_claims.sort_by(|left, right| {
-        left.path
-            .cmp(&right.path)
-            .then_with(|| left.error.cmp(&right.error))
-    });
-    Ok((valid_claims, invalid_claims))
 }
 
 pub fn same_trust_input_manifest(left: &TrustInputManifest, right: &TrustInputManifest) -> bool {
@@ -1651,12 +1757,13 @@ pub(crate) mod test_support {
         let dir = std::env::temp_dir().join(format!("zbrain-index-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let paths = Paths::resolve(Options {
+        let mut paths = Paths::resolve(Options {
             cwd: Some(dir.clone()),
             home_dir: Some(dir.clone()),
             runtime_dir: Some(dir.join(".zbrain")),
         })
         .unwrap();
+        paths.key_dir = crate::signing::test_key_dir();
         ensure_config(&paths.config_file).unwrap();
         crate::workspace::create_workspace(&paths, "research", &FixedClock::new(fixed_index_now()))
             .unwrap();
@@ -1705,6 +1812,7 @@ pub(crate) mod test_support {
         claim.verified_digest = String::new();
         let digest = crate::claims::claim_verification_digest(&claim).unwrap();
         claim.verified_digest = digest;
+        crate::signing::sign_test_claim(&mut claim);
         claim
     }
 
@@ -1982,6 +2090,7 @@ mod tests {
             ..crate::claims::ClaimTransition::default()
         }];
         approved.verified_digest = crate::claims::claim_verification_digest(&approved).unwrap();
+        crate::signing::sign_test_claim(&mut approved);
         let target = crate::claims::render_claim_markdown(&approved).unwrap();
         transition::write_pending_transition(
             &paths,
@@ -2276,6 +2385,7 @@ mod tests {
         let mut approved = claim_store.approve("research", &claim.id).unwrap();
         approved.sources[0].digest = format!("sha256:{}", evidence.sha256);
         approved.verified_digest = crate::claims::claim_verification_digest(&approved).unwrap();
+        crate::signing::sign_test_claim(&mut approved);
         let claim_path = paths
             .workspaces_dir
             .join("research/wiki/projects")
@@ -2313,6 +2423,7 @@ mod tests {
         let mut approved = claim_store.approve("research", &claim.id).unwrap();
         approved.evidence_ids = vec![evidence.id.clone(), evidence.id.clone()];
         approved.verified_digest = crate::claims::claim_verification_digest(&approved).unwrap();
+        crate::signing::sign_test_claim(&mut approved);
         let claim_path = paths
             .workspaces_dir
             .join("research/wiki/projects")
@@ -3061,12 +3172,13 @@ mod tests {
         std::fs::create_dir_all(&real_root).unwrap();
         let linked_root = dir.join("linked");
         std::os::unix::fs::symlink(&real_root, &linked_root).unwrap();
-        let paths = crate::paths::Paths::resolve(crate::paths::Options {
+        let mut paths = crate::paths::Paths::resolve(crate::paths::Options {
             cwd: Some(linked_root.clone()),
             home_dir: Some(linked_root.clone()),
             runtime_dir: Some(linked_root.join(".zbrain")),
         })
         .unwrap();
+        paths.key_dir = crate::signing::test_key_dir();
         crate::config::ensure_config(&paths.config_file).unwrap();
         crate::workspace::create_workspace(&paths, "research", &FixedClock::new(fixed_index_now()))
             .unwrap();

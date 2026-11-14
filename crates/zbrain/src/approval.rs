@@ -1094,6 +1094,45 @@ pub(crate) fn write_atomic_json(
 }
 
 impl ClaimStore {
+    /// Binds the owner ceremony for a `claim approve` mutation: the canonical
+    /// draft digest, the supersede operation when the draft replaces approved
+    /// claims, and the prior verification digest that operation requires. A
+    /// pure read; `prepare_challenge` validates it and persists the challenge.
+    pub fn approve_challenge_prepare(
+        &self,
+        workspace: &str,
+        id: &str,
+    ) -> Result<ChallengePrepare, ClaimError> {
+        let (claim, digest) = self.canonical_digest(workspace, id)?;
+        if claim.status != CLAIM_STATUS_DRAFT {
+            return Err(message(format!(
+                "claim {id} is {}; only draft claims can be approved",
+                claim.status
+            )));
+        }
+        let mut superseded = claim.supersedes.clone();
+        superseded.sort();
+        let operation = if superseded.is_empty() {
+            CHALLENGE_OPERATION_APPROVE
+        } else {
+            CHALLENGE_OPERATION_SUPERSEDE
+        };
+        let prior_verification_digest = if superseded.is_empty() {
+            String::new()
+        } else {
+            self.first_superseded_verification_digest(workspace, &superseded)?
+        };
+        Ok(ChallengePrepare {
+            workspace: workspace.to_string(),
+            operation: operation.to_string(),
+            claim_id: claim.id.clone(),
+            canonical_draft_digest: digest,
+            superseded_ids: superseded,
+            prior_verification_digest,
+            ..ChallengePrepare::default()
+        })
+    }
+
     /// Atomically validates the current canonical claim and persists a
     /// challenge under the workspace lock. The general ChallengeStore prepare
     /// method remains available for the local owner ceremony, which does not
@@ -1670,12 +1709,13 @@ mod tests {
             std::env::temp_dir().join(format!("zbrain-approval-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let paths = Paths::resolve(Options {
+        let mut paths = Paths::resolve(Options {
             cwd: Some(dir.clone()),
             home_dir: Some(dir.clone()),
             runtime_dir: Some(dir.join(".zbrain")),
         })
         .unwrap();
+        paths.key_dir = crate::signing::test_key_dir();
         ensure_config(&paths.config_file).unwrap();
         let clock = FixedClock::new(fixed_now());
         create_workspace(&paths, "research", &clock).unwrap();
@@ -1751,6 +1791,7 @@ mod tests {
         approved.verified_by = "owner".to_string();
         approved.verified_digest = String::new();
         approved.verified_digest = claim_verification_digest(&approved).unwrap();
+        crate::signing::sign_test_claim(&mut approved);
         approved
     }
 

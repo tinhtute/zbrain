@@ -1,5 +1,83 @@
 # CHANGELOG
 
+## Unreleased
+
+### Changed (breaking: approved claims now require an owner signature)
+- An approved claim is trusted only when it carries an Ed25519 signature over
+  its verification digest, made with the owner key file from ADR 0002. The key
+  lives outside the runtime root at `$XDG_CONFIG_HOME/zbrain-keys` (fallback
+  `~/.config/zbrain-keys`), directory `0700`, files `0600`; a symlinked key
+  path, a path inside `ZBRAIN_HOME`, or a looser mode fails closed.
+  `reindex`, `ask`, `ask --as-of`, `status`, the viewer, and the MCP resources
+  reject unsigned or badly signed approved claims through one shared path.
+  **Existing approved claims are untrusted until re-signed**: run
+  `zbrain key init` once, then `zbrain claim resign` (the batch owner ceremony
+  lists every approved claim and honors `--exclude`). `doctor` names both
+  commands. A lost private key needs `zbrain key init --recover`, which prints
+  the new key id, writes it only when the owner types that id, and retires the
+  previous keys so existing claims keep verifying. Revoke and supersede transitions are not signed yet (follow-up),
+  so a legacy superseded or revoked claim cannot be restored by re-signing:
+  `claim resign` walks approved claims only, and `ask --as-of` therefore
+  reports those historical rows as a gap until the follow-up signs
+  transitions.
+- `verified` gains `alg`, `key_id`, and `sig`. The verification digest blanks
+  all `verified.*` fields, so signing a claim never changes its digest and
+  legacy files render byte-identically.
+
+### Fixed
+- `ask` checks a returned claim's declared `conflicts_with` targets against the
+  whole workspace, not only the returned page. An approved conflicting claim
+  that ranks outside the top-N now blocks the answer instead of leaving it
+  `ready`. The target must pass the same trust rule as a returned claim
+  (manifest binding, digest, owner signature, evidence closure, and the
+  `--as-of` instant), so an unverified or unsigned target neither blocks nor
+  unblocks. Covers MCP `memory_ask` and `ask --as-of`.
+- `ask --embed` no longer answers `ready` from a vector that has nothing to do
+  with the query. Vector results now count as evidence only when they share a
+  meaningful token (a non-stopword of three or more characters) with the query;
+  otherwise the answer falls back to the lexical result, which reports `gap`.
+  `--embed` therefore widens recall to partial token overlap, not to unrelated
+  claims: the loopback embedder is a hashed bag-of-words and has no paraphrase
+  recall. The same rule covers MCP `memory_ask`.
+- The viewer, MCP claim resource, `status`, and `memory_status` read claims
+  through one verified path: an approved claim whose canonical file was
+  tampered after approval is dropped or reported as invalid, never served as
+  approved. `lint`/`doctor` report invalid claims as findings. Repair and
+  owner-ceremony paths still read the canonical file so a tampered claim can
+  be revoked or migrated.
+- `claim approve` runs the owner ceremony: a piped caller is refused, and
+  approval requires confirming the last 16 hex characters of the action digest
+  on an interactive TTY — the same challenge/grant path as `approval grant`.
+  The TTY check is owner-presence friction, not a security boundary: any pty
+  passes it, and owner proof is the planned signed-approval work. `make smoke`
+  and the audit repros drive the real ceremony through
+  `scripts/owner-approve.py`.
+- Plain `ask` (and MCP `memory_ask`) now applies `stale_after` the same way
+  `ask --as-of now` does: an approved claim at or past its `stale_after` is
+  not trusted, so the answer is `gap` instead of `ready`. A stale approved
+  claim no longer takes part in conflict blocking in either direction: one
+  named in another claim's `conflicts_with` does not block it, and its own
+  `conflicts_with` blocks nothing, matching `--as-of now`
+  (`trusted-memory-spec.md` §9). `doctor` uses the same boundary (stale at or after
+  `stale_after`).
+- A non-claim `.md` anywhere under `wiki/` (outside the tier folders, or a
+  non-claim file inside one) now makes the index stale before reindex instead
+  of silently passing freshness and bricking `ask` after the next reindex.
+  `ask`, `reindex`, and `doctor` name the file and the fix (move it out of
+  `wiki/` or make it a valid claim), and `doctor`'s `next_action` says so.
+  `reindex` and MCP `memory_reindex` add `legacy_files: [{path, error}]`,
+  omitted when empty.
+- The viewer accepts only `Host: 127.0.0.1:<port>` or `localhost:<port>` for
+  its bound port, closing DNS-rebinding reads. A missing `Host` gets 400; any
+  other host, port, or a repeated `Host` gets 421 with an empty body.
+  `view --help`, the site docs, and the gateway spec state the rule.
+- When a rejected index has both a non-claim wiki file and other invalid trust
+  inputs, the error now says so ("N other invalid trust inputs also block the
+  index; zbrain reindex lists them") and `doctor`'s `next_action` names both
+  fixes, so moving the file is not presented as the whole fix. The count is
+  taken from the wiki as it is now, so it stays right when files are added or
+  moved after the rejected rebuild.
+
 ## 0.4.0 (2026-09-06) — Rust cutover
 
 The Go implementation is replaced by a Rust workspace with verified
