@@ -169,6 +169,19 @@ fn plain_note_bricks_with_actionable_error(name: &str, wiki_relative: &str) {
         "ask after reindex must fail closed:\n{after_reindex}"
     );
     assert_actionable("ask after reindex", &after_reindex, wiki_relative);
+    // The note is the only cause, so no other invalid input is reported.
+    assert!(
+        !after_reindex.contains("other invalid"),
+        "a lone note must not report other invalid inputs:\n{after_reindex}"
+    );
+    let (_, doctor) = zbrain(&fx, &["doctor", "--workspace", "research"]);
+    assert!(
+        !doctor.contains("other invalid")
+            && doctor.contains(
+                "\"next_action\": \"move non-claim files out of wiki/, then zbrain reindex\""
+            ),
+        "doctor on a rejected index with a lone note must name only the wiki fix:\n{doctor}"
+    );
 
     // Moving the note out of wiki/ is the fix the messages name.
     std::fs::rename(&note, fx.dir.join("todo.md")).unwrap();
