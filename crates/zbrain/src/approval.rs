@@ -103,7 +103,56 @@ pub struct Challenge {
     pub granted: bool,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub granted_at: String,
+    /// Owner-key signature over the grant (`zbrain.grant/v1`). The record is
+    /// a plain file under the workspace, so `granted` alone proves nothing.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub grant_key_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub grant_sig: String,
     pub consumed: bool,
+}
+
+/// The grant fields the owner signature binds, in a fixed order. Lists are
+/// JSON-encoded so element boundaries cannot be shifted.
+fn grant_signed_fields(challenge: &Challenge) -> Vec<String> {
+    let list = |ids: &[String]| serde_json::to_string(ids).unwrap_or_default();
+    vec![
+        challenge.id.clone(),
+        challenge.workspace.clone(),
+        challenge.operation.clone(),
+        challenge.action_digest.clone(),
+        challenge.token_sha256.clone(),
+        challenge.token_expires_at.clone(),
+        challenge.granted_at.clone(),
+        list(&challenge.granted_items),
+        list(&challenge.skipped_items),
+    ]
+}
+
+fn sign_grant_record(paths: &Paths, challenge: &mut Challenge) -> Result<(), ClaimError> {
+    let keys = crate::signing::KeyStore::open(paths)
+        .map_err(|err| message(format!("approval signing key unavailable: {err}")))?;
+    let fields = grant_signed_fields(challenge);
+    let refs: Vec<&str> = fields.iter().map(String::as_str).collect();
+    let (key_id, sig) = crate::signing::sign_grant(&keys, &refs)
+        .map_err(|err| message(format!("sign owner grant: {err}")))?;
+    challenge.grant_key_id = key_id;
+    challenge.grant_sig = sig;
+    Ok(())
+}
+
+fn verify_grant_record(paths: &Paths, challenge: &Challenge) -> Result<(), ClaimError> {
+    let keys = crate::signing::KeyStore::open(paths)
+        .map_err(|err| message(format!("approval signing key unavailable: {err}")))?;
+    let fields = grant_signed_fields(challenge);
+    let refs: Vec<&str> = fields.iter().map(String::as_str).collect();
+    crate::signing::verify_grant(&keys, &refs, &challenge.grant_key_id, &challenge.grant_sig)
+        .map_err(|err| {
+            message(format!(
+                "challenge {} owner grant is not valid: {err}",
+                challenge.id
+            ))
+        })
 }
 
 /// Owner-pinned action summary. No token is issued until the local owner
@@ -390,6 +439,7 @@ impl ChallengeStore {
         challenge.token_expires_at = rfc3339(token_expires_at);
         challenge.granted = true;
         challenge.granted_at = rfc3339(now);
+        sign_grant_record(&self.paths, &mut challenge)?;
         self.write_challenge(workspace, &challenge)?;
         Ok(GrantedChallenge { challenge, token })
     }
@@ -494,6 +544,7 @@ impl ChallengeStore {
         challenge.token_expires_at = rfc3339(token_expires_at);
         challenge.granted = true;
         challenge.granted_at = rfc3339(now);
+        sign_grant_record(&self.paths, &mut challenge)?;
         self.write_challenge(workspace, &challenge)?;
         Ok(GrantedChallenge { challenge, token })
     }
@@ -566,6 +617,7 @@ impl ChallengeStore {
         if now > token_expires_at {
             return Err(message(format!("challenge {} token expired", challenge.id)));
         }
+        verify_grant_record(&self.paths, challenge)?;
         let want_hash = format!("sha256:{}", hex(&Sha256::digest(token.as_bytes())));
         if !constant_time_eq(want_hash.as_bytes(), challenge.token_sha256.as_bytes()) {
             return Err(message(format!(
@@ -2166,7 +2218,11 @@ mod tests {
         let err = store
             .verify("research", &prepared.challenge.id, &token)
             .unwrap_err();
-        assert!(err.to_string().contains("token mismatch"), "{err}");
+        // A swapped hash breaks the owner grant signature before the compare.
+        assert!(
+            err.to_string().contains("owner grant is not valid"),
+            "{err}"
+        );
         restore();
 
         write_tampered(&|c| c.token_expires_at = "not-a-time".to_string());

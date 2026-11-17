@@ -10,19 +10,36 @@
   path, a path inside `ZBRAIN_HOME`, or a looser mode fails closed.
   `reindex`, `ask`, `ask --as-of`, `status`, the viewer, and the MCP resources
   reject unsigned or badly signed approved claims through one shared path.
-  **Existing approved claims are untrusted until re-signed**: run
-  `zbrain key init` once, then `zbrain claim resign` (the batch owner ceremony
-  lists every approved claim and honors `--exclude`). `doctor` names both
-  commands. A lost private key needs `zbrain key init --recover`, which prints
-  the new key id, writes it only when the owner types that id, and retires the
-  previous keys so existing claims keep verifying. Revoke and supersede transitions are not signed yet (follow-up),
-  so a legacy superseded or revoked claim cannot be restored by re-signing:
-  `claim resign` walks approved claims only, and `ask --as-of` therefore
-  reports those historical rows as a gap until the follow-up signs
-  transitions.
+  **Existing approved claims are untrusted until signed at key init**: run
+  `zbrain migrate okf` first if a workspace still holds pre-OKF claims, then
+  `zbrain key init` once. It lists every approved claim in every workspace
+  (id, title, approval time, digest), asks for each workspace's batch digest
+  suffix, honors `--exclude`, signs the confirmed claims with the new key, and
+  only then commits the key. An approved claim that appears after key init has
+  no signing path: `doctor` names it, and the owner supersedes or revokes it.
+  `zbrain claim resign` only upgrades a claim that already carries a valid
+  pre-release v1 signature. A lost private key needs
+  `zbrain key init --recover`, which prints the new key id, writes it only when
+  the owner types that id, and retires the previous keys so existing claims
+  keep verifying. Revoke and supersede transitions are not signed yet
+  (follow-up), so a legacy superseded or revoked claim cannot be restored by
+  signing, and `ask --as-of` reports those historical rows as a gap until the
+  follow-up signs transitions.
 - `verified` gains `alg`, `key_id`, and `sig`. The verification digest blanks
   all `verified.*` fields, so signing a claim never changes its digest and
   legacy files render byte-identically.
+
+### Security
+- An owner grant on a lifecycle challenge is now signed with the owner key
+  (`zbrain.grant/v1`) and verified by `apply`. Before, a writer of the
+  challenge file could mark it granted with a token hash of its choice and
+  have `apply` sign the claim. Every lifecycle `apply`, revoke included, now
+  needs the owner key; without it the grant fails after the owner confirms.
+- The approval signature now binds the workspace (`zbrain.approval/v2`). A
+  signed claim copied into another workspace no longer verifies there.
+- `claim resign` no longer signs an approved claim that has no valid
+  signature. Before, a writer could strip the signature off an approved claim,
+  rewrite it with a recomputed digest, and have the owner re-sign it.
 
 ### Fixed
 - `ask` checks a returned claim's declared `conflicts_with` targets against the

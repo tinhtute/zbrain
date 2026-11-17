@@ -11,7 +11,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use chrono::{TimeZone, Utc};
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
+use ed25519_dalek::Signer;
 use zbrain::assets::extract_bundled_assets;
+use zbrain::claims::ClaimStore;
 use zbrain::claims::{
     claim_verification_digest, render_claim_markdown, Claim, ClaimTransition, CLAIM_BASIS_OWNER,
     CLAIM_STATUS_APPROVED, CLAIM_TRANSITION_APPROVE, OKF_CLAIM_TYPE,
@@ -20,7 +24,9 @@ use zbrain::cli::{new_app, App, CliError, PromptSource};
 use zbrain::clock::FixedClock;
 use zbrain::config::ensure_config;
 use zbrain::index::{IndexStore, REBUILD_STATUS_REJECTED};
+use zbrain::lifecycle::{ResignCandidate, ResignTarget};
 use zbrain::paths::{Options, Paths};
+use zbrain::signing::{approval_message_v1, KeyStore, APPROVAL_ALGORITHM};
 use zbrain::workspace::create_workspace;
 
 const FORGED_ID: &str = "clm_00000000000000000000000000000bad";
@@ -181,7 +187,6 @@ fn draft(cli: &mut Cli, title: &str, body: &str) -> String {
 /// Answers the owner ceremony with the digest suffix the CLI will ask for.
 fn approve_via_cli(cli: &mut Cli, id: &str) -> String {
     use zbrain::approval::{action_digest_suffix, compute_challenge_action_digest};
-    use zbrain::claims::ClaimStore;
     let store = ClaimStore::with_clock(cli.app.paths.clone(), cli.app.clock.clone());
     let prepare = store.approve_challenge_prepare("research", id).unwrap();
     let suffix = action_digest_suffix(&compute_challenge_action_digest(&prepare)).to_string();
@@ -230,31 +235,36 @@ fn forged_approved_claim_is_rejected() {
 }
 
 #[test]
-fn doctor_names_the_resign_command() {
-    let fx = fixture("doctor");
-    // A legacy approved claim: valid digest, no signature. This is what every
-    // workspace looks like on the upgrade, and what the re-sign ceremony fixes.
+fn doctor_names_the_supersede_path_for_an_unsigned_claim() {
+    let fx = fixture("doctor-unsigned");
+    let mut cli = Cli::new(fx.paths.clone());
+    cli.run_ok(&["key", "init"]);
+    // Written after the key exists: no ceremony ever saw it, so nothing may
+    // sign it. The only way out is the owner supersede/revoke ceremony.
     write_forged_claim(
         &fx,
         "clm_00000000000000000000000000000002",
-        "Legacy approved fact",
-        "approved before signatures existed",
+        "Unsigned fact",
+        "written after key init",
     );
-    let mut cli = Cli::new(fx.paths.clone());
-    cli.run_ok(&["key", "init"]);
-    cli.run_ok(&["reindex"]);
-
-    // `doctor` reports domain findings by exiting 2 after printing the JSON.
     let result = cli.run(&["doctor"]);
     let output = cli.stdout();
-    assert!(
-        result.is_err(),
-        "doctor must report the unsigned claim: {output}"
-    );
-    assert!(
-        output.contains("zbrain claim resign"),
-        "doctor must name the re-sign command: {output}"
-    );
+    assert!(result.is_err(), "{output}");
+    assert!(output.contains("supersede or revoke"), "{output}");
+    assert!(!output.contains("zbrain claim resign"), "{output}");
+}
+
+#[test]
+fn doctor_names_the_resign_command_for_a_v1_signature() {
+    let fx = fixture("doctor-v1");
+    let id = "clm_00000000000000000000000000000003";
+    let mut cli = Cli::new(fx.paths.clone());
+    cli.run_ok(&["key", "init"]);
+    write_v1_signed_claim(&fx, id, "V1 fact", "signed before workspaces were bound\n");
+    let result = cli.run(&["doctor"]);
+    let output = cli.stdout();
+    assert!(result.is_err(), "{output}");
+    assert!(output.contains("zbrain claim resign"), "{output}");
 }
 
 #[test]
@@ -272,12 +282,21 @@ fn claim_approve_records_a_signature() {
 }
 
 fn resign_via_cli(cli: &mut Cli, excludes: &[&str]) -> String {
+    let store = ClaimStore::with_clock(cli.app.paths.clone(), cli.app.clock.clone());
+    let candidates = store.resign_candidates("research").unwrap();
+    cli.app.prompt = PromptSource::Scripted(vec![ceremony_suffix("resign", &candidates, excludes)]);
+    let mut argv = vec!["claim", "resign"];
+    for id in excludes {
+        argv.push("--exclude");
+        argv.push(id);
+    }
+    cli.run_ok(&argv)
+}
+
+fn ceremony_suffix(operation: &str, candidates: &[ResignCandidate], excludes: &[&str]) -> String {
     use zbrain::approval::{
         action_digest_suffix, compute_challenge_action_digest, ChallengeItem, ChallengePrepare,
     };
-    use zbrain::claims::ClaimStore;
-    let store = ClaimStore::with_clock(cli.app.paths.clone(), cli.app.clock.clone());
-    let candidates = store.resign_candidates("research").unwrap();
     let items: Vec<ChallengeItem> = candidates
         .iter()
         .filter(|candidate| !excludes.contains(&candidate.id.as_str()))
@@ -288,17 +307,60 @@ fn resign_via_cli(cli: &mut Cli, excludes: &[&str]) -> String {
         .collect();
     let digest = compute_challenge_action_digest(&ChallengePrepare {
         workspace: "research".to_string(),
-        operation: "resign".to_string(),
+        operation: operation.to_string(),
         items,
         ..ChallengePrepare::default()
     });
-    cli.app.prompt = PromptSource::Scripted(vec![action_digest_suffix(&digest).to_string()]);
-    let mut argv = vec!["claim", "resign"];
+    action_digest_suffix(&digest).to_string()
+}
+
+/// `key init` lists every approved claim and signs what the owner confirms.
+fn key_init_via_cli(cli: &mut Cli, excludes: &[&str]) -> Result<String, CliError> {
+    let store = ClaimStore::with_clock(cli.app.paths.clone(), cli.app.clock.clone());
+    let candidates = store.key_init_candidates("research").unwrap();
+    cli.app.prompt =
+        PromptSource::Scripted(vec![ceremony_suffix("key-init", &candidates, excludes)]);
+    let mut argv = vec!["key", "init"];
     for id in excludes {
         argv.push("--exclude");
         argv.push(id);
     }
-    cli.run_ok(&argv)
+    cli.run(&argv)?;
+    Ok(cli.stdout())
+}
+
+fn targets(candidates: Vec<ResignCandidate>) -> Vec<ResignTarget> {
+    candidates
+        .into_iter()
+        .map(|candidate| ResignTarget {
+            id: candidate.id,
+            digest: candidate.digest,
+            verified_at: candidate.verified_at,
+            verified_by: candidate.verified_by,
+        })
+        .collect()
+}
+
+/// A claim signed by the active key under the v1 message, which did not bind
+/// the workspace: what a v0.4 `claim approve` wrote.
+fn write_v1_signed_claim(fx: &Fixture, id: &str, title: &str, body: &str) {
+    write_forged_claim(fx, id, title, body);
+    let path = claim_path(fx, id);
+    let mut claim = zbrain::claims::parse_claim_markdown(
+        "projects",
+        &format!("projects/{id}.md"),
+        &std::fs::read(&path).unwrap(),
+    )
+    .unwrap();
+    let (key_id, key) = KeyStore::open(&fx.paths)
+        .unwrap()
+        .active_signing_key()
+        .unwrap();
+    let signature = key.sign(&approval_message_v1(&claim, &key_id));
+    claim.verified_alg = APPROVAL_ALGORITHM.to_string();
+    claim.verified_key_id = key_id;
+    claim.verified_sig = BASE64.encode(signature.to_bytes());
+    std::fs::write(&path, render_claim_markdown(&claim).unwrap()).unwrap();
 }
 
 #[test]
@@ -393,19 +455,20 @@ fn claim_approve_without_a_key_fails_before_the_ceremony() {
 }
 
 #[test]
-fn resign_batch_signs_legacy_claims_and_honors_exclusions() {
-    let fx = fixture("resign");
+fn key_init_signs_legacy_claims_and_honors_exclusions() {
+    let fx = fixture("key-init-batch");
     let keep = "clm_0000000000000000000000000000000a";
     let exclude = "clm_0000000000000000000000000000000b";
     write_forged_claim(&fx, keep, "Legacy keep", "legacy keep body\n");
     write_forged_claim(&fx, exclude, "Legacy exclude", "legacy exclude body\n");
 
     let mut cli = Cli::new(fx.paths.clone());
-    cli.run_ok(&["key", "init"]);
-    let out = resign_via_cli(&mut cli, &[exclude]);
+    let out = key_init_via_cli(&mut cli, &[exclude]).unwrap();
     let report: serde_json::Value = serde_json::from_str(&out).unwrap();
-    assert_eq!(report["signed"], serde_json::json!([keep]), "{report}");
-    assert_eq!(report["excluded"], serde_json::json!([exclude]), "{report}");
+    let signed = &report["signed_claims"][0];
+    assert_eq!(signed["workspace"], "research", "{report}");
+    assert_eq!(signed["signed"], serde_json::json!([keep]), "{report}");
+    assert_eq!(signed["excluded"], serde_json::json!([exclude]), "{report}");
 
     let summary = IndexStore::new(fx.paths.clone())
         .rebuild("research")
@@ -421,23 +484,68 @@ fn resign_batch_signs_legacy_claims_and_honors_exclusions() {
     let output = cli.stdout();
     assert!(doctor.is_err(), "{output}");
     assert!(
-        output.contains("1 approved claims are unsigned"),
+        output.contains("1 approved claims have no valid owner signature"),
         "{output}"
     );
 }
 
 #[test]
-fn resign_is_a_noop_when_claims_are_already_signed() {
-    let fx = fixture("resign-idempotent");
+fn key_init_with_a_wrong_suffix_commits_nothing() {
+    let fx = fixture("key-init-wrong");
     let id = "clm_0000000000000000000000000000000c";
     write_forged_claim(&fx, id, "Legacy claim", "legacy body\n");
     let mut cli = Cli::new(fx.paths.clone());
-    cli.run_ok(&["key", "init"]);
-    resign_via_cli(&mut cli, &[]);
-    let before = std::fs::read_to_string(claim_path(&fx, id)).unwrap();
+    cli.app.prompt = PromptSource::Scripted(vec!["0000000000000000".to_string()]);
+    let error = cli
+        .run(&["key", "init"])
+        .expect_err("a wrong suffix must be refused");
+    assert!(
+        error.to_string().contains("digest suffix mismatch"),
+        "{error}"
+    );
+    assert!(KeyStore::open(&fx.paths).is_err(), "anchor was committed");
+    let contents = std::fs::read_to_string(claim_path(&fx, id)).unwrap();
+    assert!(!contents.contains("sig:"), "{contents}");
 
-    let out = resign_via_cli(&mut cli, &[]);
-    let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+    // The rerun starts over with a fresh key and signs.
+    key_init_via_cli(&mut cli, &[]).unwrap();
+    let summary = IndexStore::new(fx.paths.clone())
+        .rebuild("research")
+        .unwrap();
+    assert_eq!(summary.approved, 1, "{summary:?}");
+}
+
+#[test]
+fn key_init_without_approved_claims_needs_no_prompt() {
+    let fx = fixture("key-init-empty");
+    let mut cli = Cli::new(fx.paths.clone());
+    let out = cli.run_ok(&["key", "init"]);
+    assert!(!out.contains("signed_claims"), "{out}");
+    KeyStore::open(&fx.paths).unwrap();
+}
+
+#[test]
+fn resign_upgrades_a_v1_signature() {
+    let fx = fixture("resign-v1");
+    let id = "clm_0000000000000000000000000000001a";
+    let mut cli = Cli::new(fx.paths.clone());
+    cli.run_ok(&["key", "init"]);
+    write_v1_signed_claim(&fx, id, "V1 claim", "v1 signed body\n");
+    let summary = IndexStore::new(fx.paths.clone())
+        .rebuild("research")
+        .unwrap();
+    assert_eq!(summary.approved, 0, "v1 must not verify as v2: {summary:?}");
+
+    let report: serde_json::Value = serde_json::from_str(&resign_via_cli(&mut cli, &[])).unwrap();
+    assert_eq!(report["signed"], serde_json::json!([id]), "{report}");
+    let summary = IndexStore::new(fx.paths.clone())
+        .rebuild("research")
+        .unwrap();
+    assert_eq!(summary.approved, 1, "{summary:?}");
+    assert_eq!(summary.invalid, 0, "{summary:?}");
+
+    let before = std::fs::read_to_string(claim_path(&fx, id)).unwrap();
+    let report: serde_json::Value = serde_json::from_str(&resign_via_cli(&mut cli, &[])).unwrap();
     assert_eq!(report["signed"], serde_json::json!([]), "{report}");
     assert_eq!(
         report["already_signed"],
@@ -447,6 +555,251 @@ fn resign_is_a_noop_when_claims_are_already_signed() {
     assert_eq!(
         std::fs::read_to_string(claim_path(&fx, id)).unwrap(),
         before
+    );
+}
+
+/// Security review before v0.5.0, finding 3: after `key init`, a writer
+/// strips the signature off an approved claim, rewrites the body, and
+/// recomputes the digest. `resign` must not turn that into a signed claim.
+#[test]
+fn resign_refuses_a_stripped_tampered_claim() {
+    let fx = fixture("resign-tampered");
+    let mut cli = Cli::new(fx.paths.clone());
+    cli.run_ok(&["key", "init"]);
+    let id = draft(&mut cli, "Refund policy", "refunds need a receipt\n");
+    approve_via_cli(&mut cli, &id);
+
+    let path = claim_path(&fx, &id);
+    let mut claim = zbrain::claims::parse_claim_markdown(
+        "projects",
+        &format!("projects/{id}.md"),
+        &std::fs::read(&path).unwrap(),
+    )
+    .unwrap();
+    claim.body = "refunds need no receipt\n".to_string();
+    claim.verified_alg.clear();
+    claim.verified_key_id.clear();
+    claim.verified_sig.clear();
+    claim.verified_digest = claim_verification_digest(&claim).unwrap();
+    std::fs::write(&path, render_claim_markdown(&claim).unwrap()).unwrap();
+
+    let store = ClaimStore::with_clock(fx.paths.clone(), cli.app.clock.clone());
+    assert!(store.resign_candidates("research").unwrap().is_empty());
+    let out = cli.run_ok(&["claim", "resign"]);
+    let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(report["signed"], serde_json::json!([]), "{report}");
+    assert!(
+        report["skipped"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("supersede or revoke"),
+        "{report}"
+    );
+    // A forged confirmed list cannot sign it either.
+    let forged = vec![ResignTarget {
+        id: id.clone(),
+        digest: claim.verified_digest.clone(),
+        verified_at: claim.verified_at.clone(),
+        verified_by: claim.verified_by.clone(),
+    }];
+    let report = store.resign_approved("research", &forged, &[]).unwrap();
+    assert!(report.signed.is_empty(), "{report:?}");
+    let contents = std::fs::read_to_string(&path).unwrap();
+    assert!(!contents.contains("sig:"), "{contents}");
+    let summary = IndexStore::new(fx.paths.clone())
+        .rebuild("research")
+        .unwrap();
+    assert_eq!(summary.approved, 0, "{summary:?}");
+
+    // The escape hatch still works: the owner supersedes the claim, later.
+    cli.app.clock = std::sync::Arc::new(FixedClock::new(
+        Utc.with_ymd_and_hms(2026, 8, 1, 10, 0, 0).unwrap(),
+    ));
+    cli.app.stdin = Box::new(Cursor::new(b"refunds need a receipt, again\n".to_vec()));
+    let out = cli.run_ok(&[
+        "claim",
+        "supersede",
+        &id,
+        "--tier",
+        "projects",
+        "--title",
+        "Refund policy",
+        "--basis",
+        "owner",
+    ]);
+    let replacement = serde_json::from_str::<serde_json::Value>(&out).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    approve_via_cli(&mut cli, &replacement);
+    let old = store.read("research", &id).unwrap();
+    assert_eq!(old.status, "superseded", "{old:?}");
+    cli.run_ok(&["reindex"]);
+    let status: serde_json::Value = serde_json::from_str(&cli.run_ok(&["status"])).unwrap();
+    assert_eq!(
+        status["catalog"],
+        serde_json::json!([{"id": replacement, "tier": "projects", "title": "Refund policy"}]),
+        "{status}"
+    );
+    assert_eq!(status["invalid"], 0, "{status}");
+
+    // Superseding must not launder the tampered body into history: neither
+    // the present nor a point in time before the supersede serves it.
+    let present: serde_json::Value =
+        serde_json::from_str(&cli.run_ok(&["ask", "refunds"])).unwrap();
+    assert_eq!(present["status"], "ready", "{present}");
+    assert_eq!(
+        present["claims"][0]["id"],
+        replacement.as_str(),
+        "{present}"
+    );
+    for argv in [
+        vec!["ask", "refunds"],
+        vec!["ask", "--as-of", "2026-08-01T09:30:00Z", "refunds"],
+    ] {
+        let result = cli.run(&argv);
+        let output = cli.stdout();
+        assert!(
+            !output.contains("refunds need no receipt"),
+            "{argv:?} served the tampered body: {output}"
+        );
+        if result.is_ok() {
+            let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+            let claims = parsed["claims"].as_array().cloned().unwrap_or_default();
+            assert!(
+                claims.iter().all(|claim| claim["id"] != id.as_str()),
+                "{argv:?}: {output}"
+            );
+        }
+    }
+}
+
+/// A run that signed claims but died before writing the key leaves claims
+/// signed by a key nobody holds. The rerun must re-sign them.
+#[test]
+fn key_init_rerun_after_an_interrupted_run_re_signs() {
+    let fx = fixture("key-init-interrupted");
+    let id = "clm_0000000000000000000000000000001c";
+    write_forged_claim(&fx, id, "Legacy claim", "legacy interrupted body\n");
+    let now = Utc.with_ymd_and_hms(2026, 8, 1, 9, 0, 0).unwrap();
+    let store = ClaimStore::with_clock(fx.paths.clone(), std::sync::Arc::new(FixedClock::new(now)));
+    let plan = KeyStore::plan_init(&fx.paths, now).unwrap();
+    let listed = targets(store.key_init_candidates("research").unwrap());
+    let report = store
+        .sign_at_key_init("research", &listed, &[], &plan)
+        .unwrap();
+    assert_eq!(report.signed, vec![id.to_string()], "{report:?}");
+    drop(plan);
+    assert!(KeyStore::open(&fx.paths).is_err(), "no key was committed");
+
+    let mut cli = Cli::new(fx.paths.clone());
+    let out = key_init_via_cli(&mut cli, &[]).unwrap();
+    let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        report["signed_claims"][0]["signed"],
+        serde_json::json!([id]),
+        "{report}"
+    );
+    let summary = IndexStore::new(fx.paths.clone())
+        .rebuild("research")
+        .unwrap();
+    assert_eq!(summary.approved, 1, "{summary:?}");
+    assert_eq!(summary.invalid, 0, "{summary:?}");
+}
+
+#[test]
+fn key_init_refused_in_a_later_workspace_commits_nothing() {
+    let fx = fixture("key-init-two");
+    let first = "clm_0000000000000000000000000000001d";
+    let second = "clm_0000000000000000000000000000001e";
+    write_forged_claim(&fx, first, "First", "first workspace body\n");
+    create_workspace(
+        &fx.paths,
+        "zeta",
+        &FixedClock::new(Utc.with_ymd_and_hms(2026, 8, 1, 9, 0, 0).unwrap()),
+    )
+    .unwrap();
+    let moved = fx.paths.workspaces_dir.join("zeta/wiki/projects");
+    std::fs::create_dir_all(&moved).unwrap();
+    write_forged_claim(&fx, second, "Second", "second workspace body\n");
+    std::fs::rename(claim_path(&fx, second), moved.join(format!("{second}.md"))).unwrap();
+
+    let mut cli = Cli::new(fx.paths.clone());
+    let store = ClaimStore::with_clock(fx.paths.clone(), cli.app.clock.clone());
+    let research = store.key_init_candidates("research").unwrap();
+    assert_eq!(research.len(), 1);
+    cli.app.prompt = PromptSource::Scripted(vec![
+        ceremony_suffix("key-init", &research, &[]),
+        "0000000000000000".to_string(),
+    ]);
+    let error = cli
+        .run(&["key", "init"])
+        .expect_err("a wrong suffix in the second workspace must refuse");
+    assert!(
+        error.to_string().contains("digest suffix mismatch"),
+        "{error}"
+    );
+    assert!(KeyStore::open(&fx.paths).is_err(), "anchor was committed");
+    for path in [claim_path(&fx, first), moved.join(format!("{second}.md"))] {
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(!contents.contains("sig:"), "{contents}");
+    }
+}
+
+#[test]
+fn resign_refuses_a_v1_claim_whose_body_was_rewritten() {
+    let fx = fixture("resign-v1-rewritten");
+    let id = "clm_0000000000000000000000000000001f";
+    let mut cli = Cli::new(fx.paths.clone());
+    cli.run_ok(&["key", "init"]);
+    write_v1_signed_claim(&fx, id, "V1 claim", "v1 original body\n");
+    let path = claim_path(&fx, id);
+    let mut claim = zbrain::claims::parse_claim_markdown(
+        "projects",
+        &format!("projects/{id}.md"),
+        &std::fs::read(&path).unwrap(),
+    )
+    .unwrap();
+    claim.body = "v1 rewritten body\n".to_string();
+    claim.verified_digest = claim_verification_digest(&claim).unwrap();
+    std::fs::write(&path, render_claim_markdown(&claim).unwrap()).unwrap();
+
+    let store = ClaimStore::with_clock(fx.paths.clone(), cli.app.clock.clone());
+    assert!(store.resign_candidates("research").unwrap().is_empty());
+    let forged = vec![ResignTarget {
+        id: id.to_string(),
+        digest: claim.verified_digest.clone(),
+        verified_at: claim.verified_at.clone(),
+        verified_by: claim.verified_by.clone(),
+    }];
+    let report = store.resign_approved("research", &forged, &[]).unwrap();
+    assert!(report.signed.is_empty(), "{report:?}");
+}
+
+#[test]
+fn resign_refuses_a_v1_claim_copied_from_another_workspace() {
+    let fx = fixture("resign-v1-copy");
+    let id = "clm_0000000000000000000000000000001b";
+    let mut cli = Cli::new(fx.paths.clone());
+    cli.run_ok(&["key", "init"]);
+    cli.run_ok(&["workspace", "create", "other"]);
+    write_v1_signed_claim(&fx, id, "V1 claim", "v1 copied body\n");
+    let other = fx
+        .paths
+        .workspaces_dir
+        .join("other/wiki/projects")
+        .join(format!("{id}.md"));
+    std::fs::copy(claim_path(&fx, id), &other).unwrap();
+
+    let store = ClaimStore::with_clock(fx.paths.clone(), cli.app.clock.clone());
+    let listed = targets(store.resign_candidates("research").unwrap());
+    let report = store.resign_approved("research", &listed, &[]).unwrap();
+    assert!(report.signed.is_empty(), "{report:?}");
+    assert!(
+        report.skipped[0]
+            .reason
+            .contains("also exists in workspace other"),
+        "{report:?}"
     );
 }
 
@@ -496,31 +849,26 @@ fn key_recover_requires_typing_the_new_key_id() {
 }
 
 #[test]
-fn resign_signs_only_the_confirmed_list() {
-    use zbrain::claims::ClaimStore;
-    use zbrain::lifecycle::ResignTarget;
-
-    let fx = fixture("resign-bound");
+fn key_init_signs_only_the_confirmed_list() {
+    let fx = fixture("key-init-bound");
     let confirmed = "clm_0000000000000000000000000000000d";
     let added = "clm_0000000000000000000000000000000e";
     let changed = "clm_0000000000000000000000000000000f";
     write_forged_claim(&fx, confirmed, "Confirmed", "confirmed body\n");
     write_forged_claim(&fx, changed, "Changed", "changed body\n");
 
-    let mut cli = Cli::new(fx.paths.clone());
-    cli.run_ok(&["key", "init"]);
-    let store = ClaimStore::with_clock(fx.paths.clone(), cli.app.clock.clone());
-    let listed: Vec<ResignTarget> = store
-        .resign_candidates("research")
-        .unwrap()
-        .into_iter()
-        .map(|candidate| ResignTarget {
-            id: candidate.id.clone(),
-            digest: candidate.digest.clone(),
-            verified_at: candidate.verified_at.clone(),
-            verified_by: candidate.verified_by.clone(),
-        })
-        .collect();
+    let store = ClaimStore::with_clock(
+        fx.paths.clone(),
+        std::sync::Arc::new(FixedClock::new(
+            Utc.with_ymd_and_hms(2026, 8, 1, 9, 0, 0).unwrap(),
+        )),
+    );
+    let plan = KeyStore::plan_init(
+        &fx.paths,
+        Utc.with_ymd_and_hms(2026, 8, 1, 9, 0, 0).unwrap(),
+    )
+    .unwrap();
+    let listed = targets(store.key_init_candidates("research").unwrap());
     assert_eq!(listed.len(), 2);
 
     // While the prompt waits: a new approved claim appears, and one listed
@@ -528,7 +876,10 @@ fn resign_signs_only_the_confirmed_list() {
     write_forged_claim(&fx, added, "Added", "added body\n");
     write_forged_claim(&fx, changed, "Changed", "changed body, rewritten\n");
 
-    let report = store.resign_approved("research", &listed, &[]).unwrap();
+    let report = store
+        .sign_at_key_init("research", &listed, &[], &plan)
+        .unwrap();
+    plan.commit().unwrap();
     assert_eq!(report.signed, vec![confirmed.to_string()], "{report:?}");
     let skipped: Vec<&str> = report.skipped.iter().map(|skip| skip.id.as_str()).collect();
     assert_eq!(skipped, vec![added, changed], "{report:?}");
@@ -545,30 +896,25 @@ fn resign_signs_only_the_confirmed_list() {
 }
 
 #[test]
-fn resign_refuses_a_claim_whose_approval_time_or_approver_changed() {
-    use zbrain::claims::ClaimStore;
-    use zbrain::lifecycle::ResignTarget;
-
-    let fx = fixture("resign-verified-block");
+fn key_init_refuses_a_claim_whose_approval_time_or_approver_changed() {
+    let fx = fixture("key-init-verified-block");
     let moved = "clm_00000000000000000000000000000010";
     let reattributed = "clm_00000000000000000000000000000011";
     write_forged_claim(&fx, moved, "Moved", "moved body\n");
     write_forged_claim(&fx, reattributed, "Reattributed", "reattributed body\n");
 
-    let mut cli = Cli::new(fx.paths.clone());
-    cli.run_ok(&["key", "init"]);
-    let store = ClaimStore::with_clock(fx.paths.clone(), cli.app.clock.clone());
-    let listed: Vec<ResignTarget> = store
-        .resign_candidates("research")
-        .unwrap()
-        .into_iter()
-        .map(|candidate| ResignTarget {
-            id: candidate.id.clone(),
-            digest: candidate.digest.clone(),
-            verified_at: candidate.verified_at.clone(),
-            verified_by: candidate.verified_by.clone(),
-        })
-        .collect();
+    let store = ClaimStore::with_clock(
+        fx.paths.clone(),
+        std::sync::Arc::new(FixedClock::new(
+            Utc.with_ymd_and_hms(2026, 8, 1, 9, 0, 0).unwrap(),
+        )),
+    );
+    let plan = KeyStore::plan_init(
+        &fx.paths,
+        Utc.with_ymd_and_hms(2026, 8, 1, 9, 0, 0).unwrap(),
+    )
+    .unwrap();
+    let listed = targets(store.key_init_candidates("research").unwrap());
     assert_eq!(listed.len(), 2);
 
     // The digest blanks `verified.*`, so both rewrites keep the digest the
@@ -591,7 +937,9 @@ fn resign_refuses_a_claim_whose_approval_time_or_approver_changed() {
         "agent",
     );
 
-    let report = store.resign_approved("research", &listed, &[]).unwrap();
+    let report = store
+        .sign_at_key_init("research", &listed, &[], &plan)
+        .unwrap();
     assert!(report.signed.is_empty(), "{report:?}");
     assert_eq!(report.skipped.len(), 2, "{report:?}");
     for skip in &report.skipped {
@@ -607,4 +955,87 @@ fn resign_refuses_a_claim_whose_approval_time_or_approver_changed() {
             "{id} was signed after its verified block changed: {contents}"
         );
     }
+}
+
+/// Security review before v0.5.0, finding 2: the signature must bind the
+/// workspace, or a signed claim copied into another workspace stays trusted.
+#[test]
+fn signed_claim_copied_into_another_workspace_is_rejected() {
+    let fx = fixture("cross-workspace");
+    let mut cli = Cli::new(fx.paths.clone());
+    cli.run_ok(&["key", "init"]);
+    let id = draft(&mut cli, "Agent fact", "cross workspace replay answer\n");
+    approve_via_cli(&mut cli, &id);
+
+    create_workspace(
+        &fx.paths,
+        "other",
+        &FixedClock::new(Utc.with_ymd_and_hms(2026, 8, 1, 9, 0, 0).unwrap()),
+    )
+    .unwrap();
+    let copy = fx
+        .paths
+        .workspaces_dir
+        .join("other/wiki/projects")
+        .join(format!("{id}.md"));
+    std::fs::copy(claim_path(&fx, &id), &copy).unwrap();
+
+    let summary = IndexStore::new(fx.paths.clone()).rebuild("other").unwrap();
+    assert_eq!(summary.approved, 0, "{summary:?}");
+    assert!(summary.invalid >= 1, "{summary:?}");
+    assert_eq!(summary.rebuild_state, REBUILD_STATUS_REJECTED);
+
+    // The original stays trusted in its own workspace.
+    let summary = IndexStore::new(fx.paths.clone())
+        .rebuild("research")
+        .unwrap();
+    assert_eq!(summary.approved, 1, "{summary:?}");
+    assert_eq!(summary.invalid, 0, "{summary:?}");
+}
+
+/// The v2 signature binds the claim's own workspace, so a secondary
+/// workspace read with `--include` must verify against that workspace.
+#[test]
+fn included_workspace_claim_verifies_against_its_own_workspace() {
+    use zbrain::approval::{action_digest_suffix, compute_challenge_action_digest};
+    let fx = fixture("include");
+    let mut cli = Cli::new(fx.paths.clone());
+    cli.run_ok(&["key", "init"]);
+    cli.run_ok(&["workspace", "create", "other"]);
+    cli.app.stdin = Box::new(Cursor::new(b"secondary included answer\n".to_vec()));
+    let out = cli.run_ok(&[
+        "claim",
+        "draft",
+        "--tier",
+        "projects",
+        "--title",
+        "Other fact",
+        "--basis",
+        "owner",
+        "--workspace",
+        "other",
+    ]);
+    let id = serde_json::from_str::<serde_json::Value>(&out).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let store = ClaimStore::with_clock(cli.app.paths.clone(), cli.app.clock.clone());
+    let prepare = store.approve_challenge_prepare("other", &id).unwrap();
+    let suffix = action_digest_suffix(&compute_challenge_action_digest(&prepare)).to_string();
+    cli.app.prompt = PromptSource::Scripted(vec![suffix]);
+    cli.run_ok(&["claim", "approve", &id, "--workspace", "other"]);
+    cli.run_ok(&["reindex", "--workspace", "other"]);
+    cli.run_ok(&["reindex", "--workspace", "research"]);
+
+    let asked: serde_json::Value = serde_json::from_str(&cli.run_ok(&[
+        "ask",
+        "secondary included",
+        "--workspace",
+        "research",
+        "--include",
+        "other",
+    ]))
+    .unwrap();
+    assert_eq!(asked["status"], "ready", "{asked}");
+    assert_eq!(asked["claims"][0]["id"], id.as_str(), "{asked}");
 }

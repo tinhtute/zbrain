@@ -104,7 +104,7 @@ fn claim_path(fx: &Fixture, id: &str) -> PathBuf {
 fn write_claim(fx: &Fixture, claim: &mut Claim) {
     claim.verified_digest = claim_verification_digest(claim).unwrap();
     let keys = zbrain::signing::KeyStore::open(&fx.paths).unwrap();
-    zbrain::signing::sign_claim(claim, &keys).unwrap();
+    zbrain::signing::sign_claim(claim, "research", &keys).unwrap();
     let rendered = render_claim_markdown(claim).unwrap();
     let dir = fx.paths.workspaces_dir.join("research/wiki/projects");
     std::fs::create_dir_all(&dir).unwrap();
@@ -454,7 +454,7 @@ fn status_reports_unsigned_claim_as_invalid() {
         invalid[0]["error"]
             .as_str()
             .unwrap_or_default()
-            .contains("unsigned"),
+            .contains("no owner signature"),
         "invalid error: {invalid:?}"
     );
 }

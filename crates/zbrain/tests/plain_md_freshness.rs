@@ -79,7 +79,7 @@ fn indexed_workspace(name: &str) -> Fixture {
     };
     claim.verified_digest = claim_verification_digest(&claim).unwrap();
     let keys = zbrain::signing::KeyStore::open(&paths).unwrap();
-    zbrain::signing::sign_claim(&mut claim, &keys).unwrap();
+    zbrain::signing::sign_claim(&mut claim, "research", &keys).unwrap();
     let projects = paths.workspaces_dir.join("research/wiki/projects");
     std::fs::create_dir_all(&projects).unwrap();
     std::fs::write(
