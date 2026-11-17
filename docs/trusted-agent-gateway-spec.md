@@ -93,7 +93,9 @@ expose grant, approval UI, or mutation HTTP endpoints.
 SHA-256 action digest; it never returns a token. The owner runs `zbrain approval
 show <challenge-id>` and `zbrain approval grant <challenge-id>`, confirms a
 digest suffix in an interactive TTY, and receives the newly issued one-time
-token to give to the agent. `apply` validates the challenge, token hash, both
+token to give to the agent. The grant record is signed with the owner key
+(ADR 0002 amendment), so `apply` needs the key and rejects a grant it did not
+sign. `apply` validates the challenge, grant signature, token hash, both
 expiries, workspace, action digest, and current canonical draft under the
 workspace lock before consuming the token and applying the transition.
 

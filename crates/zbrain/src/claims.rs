@@ -1927,28 +1927,6 @@ impl ClaimStore {
         }
     }
 
-    /// Approved claims whose signature does not verify against the anchor.
-    /// `doctor` uses this to name the batch re-sign command; a missing anchor
-    /// is reported separately, so this returns only signature failures.
-    pub fn unsigned_approved_claims(&self, workspace: &str) -> Result<Vec<String>, ClaimError> {
-        let store = match crate::signing::KeyStore::open(&self.paths) {
-            Ok(store) => store,
-            Err(_) => return Ok(Vec::new()),
-        };
-        let scan = self.scan_workspace_inner(workspace, false)?;
-        let mut ids: Vec<String> = scan
-            .claims
-            .iter()
-            .filter(|claim| claim.status == CLAIM_STATUS_APPROVED)
-            .filter(|claim| {
-                crate::signing::verify_claim_signature(claim, workspace, &store).is_err()
-            })
-            .map(|claim| claim.id.clone())
-            .collect();
-        ids.sort();
-        Ok(ids)
-    }
-
     pub(crate) fn scan_workspace_inner(
         &self,
         workspace: &str,

@@ -66,6 +66,26 @@ pub struct ResignReport {
     pub skipped: Vec<ResignSkip>,
 }
 
+/// What lets a confirmed claim be signed: a valid v1 owner signature to
+/// upgrade, or the owner's confirmation while `key init` creates the key.
+enum SignAuthority<'a> {
+    Upgrade {
+        keys: &'a crate::signing::KeyStore,
+        elsewhere: &'a std::collections::HashMap<String, String>,
+    },
+    KeyInit(&'a crate::signing::KeyInitPlan),
+}
+
+fn resign_candidate(claim: &Claim) -> ResignCandidate {
+    ResignCandidate {
+        id: claim.id.clone(),
+        title: claim.title.clone(),
+        verified_at: claim.verified_at.clone(),
+        verified_by: claim.verified_by.clone(),
+        digest: claim.verified_digest.clone(),
+    }
+}
+
 /// Provenance for callers that execute a lifecycle transition through a
 /// prepared owner challenge. Empty options keep the existing CLI owner
 /// provenance and serialized shape.
@@ -231,28 +251,99 @@ impl ClaimStore {
         Ok(plan.claim)
     }
 
-    /// Approved claims the batch re-sign ceremony will walk, in path order.
-    pub fn resign_candidates(&self, workspace: &str) -> Result<Vec<ResignCandidate>, ClaimError> {
+    /// Workspace directory names under the runtime, sorted.
+    pub fn workspace_names(&self) -> Result<Vec<String>, ClaimError> {
+        let entries = match std::fs::read_dir(&self.paths.workspaces_dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(message(format!("list workspaces: {err}"))),
+        };
+        let mut names = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(ClaimError::Io)?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                && crate::paths::is_safe_workspace_name(&name)
+            {
+                names.push(name);
+            }
+        }
+        names.sort();
+        Ok(names)
+    }
+
+    /// Approved claims `key init` offers to sign: every approved claim, since
+    /// no owner key exists yet. The owner's confirmation at key init is the
+    /// trust snapshot (ADR 0002, design D).
+    pub fn key_init_candidates(&self, workspace: &str) -> Result<Vec<ResignCandidate>, ClaimError> {
         let scan = self.scan_workspace_inner(workspace, false)?;
         Ok(scan
             .claims
             .iter()
             .filter(|claim| claim.status == CLAIM_STATUS_APPROVED)
-            .map(|claim| ResignCandidate {
-                id: claim.id.clone(),
-                title: claim.title.clone(),
-                verified_at: claim.verified_at.clone(),
-                verified_by: claim.verified_by.clone(),
-                digest: claim.verified_digest.clone(),
-            })
+            .map(resign_candidate)
             .collect())
     }
 
-    /// Sign the confirmed `targets` with the active owner key, except
-    /// `excludes`. A claim whose current digest differs from the confirmed
-    /// one, or that is not in the confirmed list, is skipped and reported.
-    /// Re-running is a no-op: a claim already carrying the active key's
-    /// signature is reported as already signed and the file is not rewritten.
+    /// Approved claims the re-sign ceremony will walk, in path order: only
+    /// claims whose pre-release v1 owner signature verifies and that no v2
+    /// signature covers yet. An unsigned or tampered claim is never offered.
+    pub fn resign_candidates(&self, workspace: &str) -> Result<Vec<ResignCandidate>, ClaimError> {
+        let keys = crate::signing::KeyStore::open(&self.paths)
+            .map_err(|err| message(format!("approval signing key unavailable: {err}")))?;
+        let scan = self.scan_workspace_inner(workspace, false)?;
+        Ok(scan
+            .claims
+            .iter()
+            .filter(|claim| claim.status == CLAIM_STATUS_APPROVED)
+            .filter(|claim| {
+                crate::signing::verify_claim_signature(claim, workspace, &keys).is_err()
+                    && crate::signing::verify_claim_signature_v1(claim, &keys).is_ok()
+            })
+            .map(resign_candidate)
+            .collect())
+    }
+
+    /// Approved claims in `workspace` without a valid v2 signature, split
+    /// into those `claim resign` can upgrade (valid v1 signature) and those
+    /// that stay untrusted until superseded or revoked. Empty when no key.
+    pub fn unsigned_approved_claims(
+        &self,
+        workspace: &str,
+    ) -> Result<(Vec<String>, Vec<String>), ClaimError> {
+        let store = match crate::signing::KeyStore::open(&self.paths) {
+            Ok(store) => store,
+            Err(_) => return Ok((Vec::new(), Vec::new())),
+        };
+        let scan = self.scan_workspace_inner(workspace, false)?;
+        let mut upgradable = Vec::new();
+        let mut unsigned = Vec::new();
+        for claim in scan
+            .claims
+            .iter()
+            .filter(|claim| claim.status == CLAIM_STATUS_APPROVED)
+            .filter(|claim| {
+                crate::signing::verify_claim_signature(claim, workspace, &store).is_err()
+            })
+        {
+            if crate::signing::verify_claim_signature_v1(claim, &store).is_ok() {
+                upgradable.push(claim.id.clone());
+            } else {
+                unsigned.push(claim.id.clone());
+            }
+        }
+        upgradable.sort();
+        unsigned.sort();
+        Ok((upgradable, unsigned))
+    }
+
+    /// Upgrade the confirmed `targets` from a v1 to a v2 signature, except
+    /// `excludes`. Only a claim whose v1 owner signature verifies over the
+    /// unchanged verified block is signed; anything else is skipped with the
+    /// reason. A v1 signature names no workspace, so a claim whose id also
+    /// exists in another workspace is refused as a possible copy. Re-running
+    /// is a no-op: a claim with a valid v2 signature is reported as already
+    /// signed and not rewritten.
     pub fn resign_approved(
         &self,
         workspace: &str,
@@ -261,6 +352,52 @@ impl ClaimStore {
     ) -> Result<ResignReport, ClaimError> {
         let keys = crate::signing::KeyStore::open(&self.paths)
             .map_err(|err| message(format!("approval signing key unavailable: {err}")))?;
+        let mut elsewhere = std::collections::HashMap::new();
+        for other in self.workspace_names()? {
+            if other == workspace {
+                continue;
+            }
+            let scan = self.scan_workspace_inner(&other, false).map_err(|err| {
+                message(format!(
+                    "check workspace {other} for copies before re-signing: {err}"
+                ))
+            })?;
+            for claim in scan.claims {
+                elsewhere.insert(claim.id, other.clone());
+            }
+        }
+        self.sign_confirmed(
+            workspace,
+            targets,
+            excludes,
+            SignAuthority::Upgrade {
+                keys: &keys,
+                elsewhere: &elsewhere,
+            },
+        )
+    }
+
+    /// Sign the owner-confirmed `targets` with the uncommitted key from a
+    /// `key init` ceremony. The caller commits the key after every workspace
+    /// is written, so a crash here leaves no committed anchor and the rerun
+    /// re-signs.
+    pub fn sign_at_key_init(
+        &self,
+        workspace: &str,
+        targets: &[ResignTarget],
+        excludes: &[String],
+        plan: &crate::signing::KeyInitPlan,
+    ) -> Result<ResignReport, ClaimError> {
+        self.sign_confirmed(workspace, targets, excludes, SignAuthority::KeyInit(plan))
+    }
+
+    fn sign_confirmed(
+        &self,
+        workspace: &str,
+        targets: &[ResignTarget],
+        excludes: &[String],
+        authority: SignAuthority<'_>,
+    ) -> Result<ResignReport, ClaimError> {
         let _lock = crate::coordination::acquire_workspace_lock(&self.paths, workspace, true)
             .map_err(message)?;
         recover_pending_transition_for_mutation_unlocked(&self.paths, workspace)
@@ -273,8 +410,40 @@ impl ClaimStore {
             .iter()
             .filter(|claim| claim.status == CLAIM_STATUS_APPROVED)
         {
+            if let SignAuthority::Upgrade { keys, .. } = &authority {
+                if crate::signing::verify_claim_signature(claim, workspace, keys).is_ok() {
+                    report.already_signed.push(claim.id.clone());
+                    continue;
+                }
+            }
             if excludes.iter().any(|id| id == &claim.id) {
                 report.excluded.push(claim.id.clone());
+                continue;
+            }
+            let refusal = match &authority {
+                SignAuthority::Upgrade { keys, elsewhere } => {
+                    if crate::signing::verify_claim_signature_v1(claim, keys).is_err() {
+                        Some(
+                            "no valid owner signature to upgrade; supersede or revoke it \
+                             through the owner ceremony"
+                                .to_string(),
+                        )
+                    } else {
+                        elsewhere.get(&claim.id).map(|other| {
+                            format!(
+                                "claim id also exists in workspace {other}; a v1 signature \
+                                 does not bind a workspace"
+                            )
+                        })
+                    }
+                }
+                SignAuthority::KeyInit(_) => None,
+            };
+            if let Some(reason) = refusal {
+                report.skipped.push(ResignSkip {
+                    id: claim.id.clone(),
+                    reason,
+                });
                 continue;
             }
             let Some(target) = targets.iter().find(|target| target.id == claim.id) else {
@@ -310,15 +479,13 @@ impl ClaimStore {
                 continue;
             }
             let mut signed = claim.clone();
-            crate::signing::sign_claim(&mut signed, workspace, &keys)
-                .map_err(|err| message(format!("sign claim {}: {err}", claim.id)))?;
-            if signed.verified_alg == claim.verified_alg
-                && signed.verified_key_id == claim.verified_key_id
-                && signed.verified_sig == claim.verified_sig
-            {
-                report.already_signed.push(claim.id.clone());
-                continue;
+            match &authority {
+                SignAuthority::Upgrade { keys, .. } => {
+                    crate::signing::sign_claim(&mut signed, workspace, keys)
+                }
+                SignAuthority::KeyInit(plan) => plan.sign_claim(&mut signed, workspace),
             }
+            .map_err(|err| message(format!("sign claim {}: {err}", claim.id)))?;
             pending.push(signed);
         }
         for target in targets {

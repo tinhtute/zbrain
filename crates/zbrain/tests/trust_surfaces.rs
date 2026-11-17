@@ -454,7 +454,7 @@ fn status_reports_unsigned_claim_as_invalid() {
         invalid[0]["error"]
             .as_str()
             .unwrap_or_default()
-            .contains("unsigned"),
+            .contains("no owner signature"),
         "invalid error: {invalid:?}"
     );
 }

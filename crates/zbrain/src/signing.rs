@@ -168,6 +168,12 @@ impl KeyStore {
         init_key_dir(&paths.key_dir, &paths.runtime_dir, now)
     }
 
+    /// Plan an init without writing anything: the same refusals as `init`,
+    /// with the new key held in memory until `KeyInitPlan::commit`.
+    pub fn plan_init(paths: &Paths, now: DateTime<Utc>) -> Result<KeyInitPlan, KeyError> {
+        plan_key_init(&paths.key_dir, &paths.runtime_dir, now)
+    }
+
     /// Plan a recovery for a lost private key. Existing claims still verify
     /// against the retired public keys; nothing is written until `commit`.
     ///
@@ -353,13 +359,14 @@ fn open_key_dir(dir: &Path, runtime_dir: &Path) -> Result<KeyStore, KeyError> {
     Ok(KeyStore { dir, keys })
 }
 
-fn init_key_dir(dir: &Path, runtime_dir: &Path, now: DateTime<Utc>) -> Result<KeyInit, KeyError> {
+/// Refuse an init when the anchor is committed; otherwise return the key
+/// directory. A leftover uncommitted private key is a crashed init and is
+/// replaced.
+fn check_init_allowed(dir: &Path, runtime_dir: &Path) -> Result<PathBuf, KeyError> {
     let dir = dir.to_path_buf();
     check_placement(&dir, runtime_dir)?;
     if dir.exists() {
         check_directory(&dir)?;
-    } else {
-        create_key_directory(&dir)?;
     }
     let private_path = dir.join(PRIVATE_KEY_FILE);
     let state_path = dir.join(KEY_STATE_FILE);
@@ -392,45 +399,107 @@ fn init_key_dir(dir: &Path, runtime_dir: &Path, now: DateTime<Utc>) -> Result<Ke
             ids.join(", ")
         )));
     }
+    Ok(dir)
+}
+
+/// A key generated in memory and not yet committed. `key init` signs the
+/// owner-confirmed legacy claims with it first and commits the anchor last,
+/// so no crash leaves a committed key beside unsigned confirmed claims: a
+/// rerun regenerates the key and re-signs (ADR 0002, design D).
+#[derive(Debug)]
+pub struct KeyInitPlan {
+    dir: PathBuf,
+    runtime_dir: PathBuf,
+    key_id: String,
+    signing_key: SigningKey,
+    now: DateTime<Utc>,
+}
+
+impl KeyInitPlan {
+    pub fn key_id(&self) -> &str {
+        &self.key_id
+    }
+
+    /// Sign a claim's verified block with the uncommitted key.
+    pub fn sign_claim(&self, claim: &mut Claim, workspace: &str) -> Result<(), KeyError> {
+        sign_claim_with_key(claim, workspace, &self.key_id, &self.signing_key)
+    }
+
+    /// Write the private key, the public key, and last the state file, the
+    /// commit marker. Refuses if another init committed meanwhile.
+    pub fn commit(self) -> Result<KeyInit, KeyError> {
+        let dir = check_init_allowed(&self.dir, &self.runtime_dir)?;
+        if !dir.exists() {
+            create_key_directory(&dir)?;
+        }
+        let public_key = self.signing_key.verifying_key();
+        let private_key = write_key_file(
+            &dir,
+            PRIVATE_KEY_FILE,
+            format!("{}\n", BASE64.encode(self.signing_key.to_bytes())).as_bytes(),
+        )?;
+        let public_path = write_key_file(
+            &dir,
+            PUBLIC_KEY_FILE,
+            format!("{}\n", BASE64.encode(public_key.to_bytes())).as_bytes(),
+        )?;
+        // The state file lands last: a crash before this rename leaves no
+        // committed anchor, so the next `init` regenerates and converges.
+        let keys_file = write_key_file(
+            &dir,
+            KEY_STATE_FILE,
+            &key_state_yaml(&[AnchorKey {
+                key_id: self.key_id.clone(),
+                public_key,
+                state: "active".to_string(),
+                created_at: crate::clock::rfc3339(self.now),
+                retired_at: String::new(),
+                revoked_at: String::new(),
+            }]),
+        )?;
+        Ok(KeyInit {
+            key_id: self.key_id,
+            dir,
+            private_key,
+            public_key: public_path,
+            keys_file,
+        })
+    }
+}
+
+fn plan_key_init(
+    dir: &Path,
+    runtime_dir: &Path,
+    now: DateTime<Utc>,
+) -> Result<KeyInitPlan, KeyError> {
+    let dir = check_init_allowed(dir, runtime_dir)?;
     let signing_key = SigningKey::generate(&mut rand_core::OsRng);
-    let public_key = signing_key.verifying_key();
-    let key_id = key_id_for(&public_key);
-    let created_at = crate::clock::rfc3339(now);
-    let private_key = write_key_file(
-        &dir,
-        PRIVATE_KEY_FILE,
-        format!("{}\n", BASE64.encode(signing_key.to_bytes())).as_bytes(),
-    )?;
-    let public_path = write_key_file(
-        &dir,
-        PUBLIC_KEY_FILE,
-        format!("{}\n", BASE64.encode(public_key.to_bytes())).as_bytes(),
-    )?;
-    // The state file lands last: a crash before this rename leaves no
-    // committed anchor, so the next `init` regenerates and converges.
-    let keys_file = write_key_file(
-        &dir,
-        KEY_STATE_FILE,
-        &key_state_yaml(&[AnchorKey {
-            key_id: key_id.clone(),
-            public_key,
-            state: "active".to_string(),
-            created_at,
-            retired_at: String::new(),
-            revoked_at: String::new(),
-        }]),
-    )?;
-    Ok(KeyInit {
-        key_id,
+    let key_id = key_id_for(&signing_key.verifying_key());
+    Ok(KeyInitPlan {
         dir,
-        private_key,
-        public_key: public_path,
-        keys_file,
+        runtime_dir: runtime_dir.to_path_buf(),
+        key_id,
+        signing_key,
+        now,
     })
+}
+
+fn init_key_dir(dir: &Path, runtime_dir: &Path, now: DateTime<Utc>) -> Result<KeyInit, KeyError> {
+    plan_key_init(dir, runtime_dir, now)?.commit()
 }
 
 /// Sign the claim's current verified block with the active owner key.
 pub fn sign_claim(claim: &mut Claim, workspace: &str, store: &KeyStore) -> Result<(), KeyError> {
+    let (key_id, signing_key) = store.active_signing_key()?;
+    sign_claim_with_key(claim, workspace, &key_id, &signing_key)
+}
+
+fn sign_claim_with_key(
+    claim: &mut Claim,
+    workspace: &str,
+    key_id: &str,
+    signing_key: &SigningKey,
+) -> Result<(), KeyError> {
     if claim.verified_at.is_empty()
         || claim.verified_by.is_empty()
         || claim.verified_digest.is_empty()
@@ -442,11 +511,10 @@ pub fn sign_claim(claim: &mut Claim, workspace: &str, store: &KeyStore) -> Resul
     if workspace.is_empty() || workspace.contains('\n') {
         return Err(KeyError::new("approval needs a single-line workspace name"));
     }
-    let (key_id, signing_key) = store.active_signing_key()?;
-    let message = approval_message(claim, workspace, &key_id);
+    let message = approval_message(claim, workspace, key_id);
     let signature = signing_key.sign(&message);
     claim.verified_alg = APPROVAL_ALGORITHM.to_string();
-    claim.verified_key_id = key_id;
+    claim.verified_key_id = key_id.to_string();
     claim.verified_sig = BASE64.encode(signature.to_bytes());
     Ok(())
 }
@@ -480,7 +548,7 @@ fn verify_claim_with(
         && claim.verified_sig.is_empty()
     {
         return Err(KeyError::new(format!(
-            "claim {} is unsigned; run `zbrain claim resign`",
+            "claim {} has no owner signature; supersede or revoke it through the owner ceremony",
             claim.id
         )));
     }
@@ -1206,14 +1274,14 @@ mod tests {
     }
 
     #[test]
-    fn unsigned_claim_is_rejected_with_the_resign_hint() {
+    fn unsigned_claim_is_rejected_with_the_supersede_hint() {
         let fx = fixture("unsigned");
         KeyStore::init(&fx.paths, now()).unwrap();
         let store = KeyStore::open(&fx.paths).unwrap();
         let claim = approved_claim();
         let error = verify_claim_signature(&claim, "research", &store).unwrap_err();
-        assert!(error.to_string().contains("unsigned"), "{error}");
-        assert!(error.to_string().contains("zbrain claim resign"), "{error}");
+        assert!(error.to_string().contains("no owner signature"), "{error}");
+        assert!(error.to_string().contains("supersede or revoke"), "{error}");
     }
 
     #[test]

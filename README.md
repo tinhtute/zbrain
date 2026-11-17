@@ -84,10 +84,13 @@ integration surfaces described in [`docs/trusted-agent-gateway-spec.md`](docs/tr
   `0700`, files `0600`, refusing symlinks, a path inside `ZBRAIN_HOME`, looser
   modes, and an existing key. `zbrain key init --recover` is the loss path:
   it prints the new key id, writes the key only when the owner types that id,
-  and retires the previous keys so their claims keep verifying. `zbrain claim
-  resign` re-signs every approved claim in one TTY ceremony, listing id, title,
-  approval time, and digest and honoring `--exclude`; claims left unsigned stay
-  untrusted.
+  and retires the previous keys so their claims keep verifying. When approved
+  claims already exist, `key init` lists them per workspace (id, title,
+  approval time, digest), asks for each batch digest suffix, honors
+  `--exclude`, and signs the confirmed claims before it commits the key; run
+  `migrate okf` before it. An approved claim without a valid signature stays
+  untrusted; the owner supersedes or revokes it. `zbrain claim resign` only
+  upgrades a claim with a valid pre-release v1 signature.
 
 All three surfaces reuse workspace boundaries and fail-closed trust validation;
 canonical Markdown and immutable evidence remain the trust inputs.
@@ -208,7 +211,7 @@ zbrain mcp serve
 zbrain view
 zbrain approval show <challenge-id>
 zbrain approval grant <challenge-id>
-zbrain key init
+zbrain key init [--exclude <id>]... | zbrain key init --recover
 zbrain version
 ```
 

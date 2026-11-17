@@ -49,7 +49,8 @@ Owner decision, 2026-11-12:
      `signing: required` (a pin, not an anchor).
    - Dependencies: `ed25519-dalek` and `sha2`, plus `base64` (the on-disk
      encoding) and `rand_core` (key generation). No platform code.
-2. **Migration: re-sign through one batch owner ceremony.** It lists id, title,
+2. **Migration: sign at key init through one batch owner ceremony** (amended
+   2026-11-17, see "Amendment"). It lists id, title,
    `verified.at` and digest for every approved claim and lets the owner exclude
    any. Legacy claims stay unsigned and untrusted until re-signed; `doctor`
    prints the exact command. No in-file legacy marker, and no grandfather
@@ -144,8 +145,10 @@ verified:
   sig: base64...              # new
 ```
 
-- Signed message: `"zbrain.approval/v1\n" + claim_id + "\n" + verified.digest
-  + "\n" + verified.at + "\n" + verified.by + "\n" + key_id`. The digest blanks
+- Signed message (v2, see "Amendment"): `"zbrain.approval/v2\n" + workspace +
+  "\n" + claim_id + "\n" + verified.digest + "\n" + verified.at + "\n" +
+  verified.by + "\n" + key_id`. The pre-release v1 message had no workspace
+  line. The digest blanks
   `at`/`by` (`claim_verification_digest`), so signing only the digest would leave
   them forgeable; the signature must bind them.
 - Verification: recompute the digest, check `key_id` is in the anchor and not
@@ -174,6 +177,40 @@ exists in `approval.rs`).
 - Rejected alternatives: an in-file marker (`verified.legacy: true`) is worthless
   because a forger writes it (repro 01 again); failing closed with no re-sign
   path breaks every existing workspace.
+
+## Amendment (2026-11-17, security review before v0.5.0)
+
+A review of the release candidate found three ways a writer of files (T2)
+still got an owner signature. All three are fixed in the same release.
+
+1. **Grants are signed.** The challenge file recorded `granted` and the token
+   hash in plain JSON, so a writer could grant a challenge and choose the token;
+   `apply` then signed the claim. `grant` now signs the record with the owner
+   key (`"zbrain.grant/v1"` over id, workspace, operation, action digest, token
+   hash, token expiry, grant time, granted and skipped items, key id), and
+   `apply` verifies it before it compares the token. Only the active key
+   verifies a grant. Every lifecycle `apply`, revoke included, now needs the
+   key.
+2. **The signature binds the workspace** (`zbrain.approval/v2`). A v1-signed
+   claim copied into another workspace verified there.
+3. **Legacy claims are signed only at key init.** The original migration let
+   `claim resign` sign any approved claim with a valid digest at any time. A
+   writer could strip the signature off a signed claim, rewrite it with a
+   recomputed digest, and wait for the owner to re-sign it; the ceremony list
+   was the only control. Now:
+   - `key init` builds the key in memory, runs the batch ceremony per
+     workspace, signs the confirmed claims, and writes the key and anchor
+     last. A refused or interrupted run commits no key, so the rerun starts
+     over. The premise is that, before a key exists, every approved claim is
+     legacy: there is nothing to strip.
+   - After key init, an approved claim without a valid signature has no
+     signing path. `doctor` names it and the owner supersedes or revokes it
+     (those transitions read the claim without requiring trust).
+   - `claim resign` only upgrades a claim with a valid v1 signature to v2. It
+     refuses a v1 claim whose id also exists in another workspace, because v1
+     does not say which workspace it was signed for.
+   - Residual risk: `migrate okf` run after key init produces unsigned
+     approved claims that can only be superseded. Run it before key init.
 
 ## Key rotation and loss
 

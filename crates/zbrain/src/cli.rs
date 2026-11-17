@@ -120,6 +120,14 @@ pub struct App {
 #[derive(Clone)]
 struct ArcClock(std::sync::Arc<dyn Clock>);
 
+/// Claims `key init` signed in one workspace.
+#[derive(Serialize)]
+struct KeyInitWorkspace {
+    workspace: String,
+    #[serde(flatten)]
+    report: crate::lifecycle::ResignReport,
+}
+
 impl Clock for ArcClock {
     fn now(&self) -> chrono::DateTime<chrono::Utc> {
         self.0.now()
@@ -286,14 +294,21 @@ impl App {
         match crate::signing::KeyStore::open(&self.paths) {
             Err(err) => findings.push(format!("approval signing key unavailable: {err}")),
             Ok(_) => {
-                let unsigned = ClaimStore::new(self.paths.clone())
+                let (upgradable, unsigned) = ClaimStore::new(self.paths.clone())
                     .unsigned_approved_claims(&workspace)
                     .map_err(|err| CliError::failure(err.to_string()))?;
+                if !upgradable.is_empty() {
+                    findings.push(format!(
+                        "{} approved claims carry a pre-release v1 signature; run `zbrain claim resign --workspace {}`",
+                        upgradable.len(),
+                        workspace
+                    ));
+                }
                 if !unsigned.is_empty() {
                     findings.push(format!(
-                        "{} approved claims are unsigned; run `zbrain claim resign --workspace {}`",
+                        "{} approved claims have no valid owner signature and stay untrusted; supersede or revoke them through the owner ceremony: {}",
                         unsigned.len(),
-                        workspace
+                        unsigned.join(", ")
                     ));
                 }
             }
@@ -833,8 +848,8 @@ impl App {
         self.write_claim_mutation(&workspace, &claim)
     }
 
-    /// Batch owner ceremony: re-sign every approved claim with the active
-    /// owner key. Lists id, title, approval time, and digest, honors
+    /// Batch owner ceremony: upgrade approved claims that carry a valid v1
+    /// owner signature to v2. Lists id, title, approval time, and digest, honors
     /// `--exclude`, and binds the ordered (id, digest) list with the same
     /// action digest the approval ceremony uses.
     fn run_claim_resign(&mut self, args: &[String]) -> Result<(), CliError> {
@@ -850,7 +865,6 @@ impl App {
         }
         let workspace = self.resolve_workspace(parsed.single("workspace"))?;
         let excludes = parsed.all("exclude");
-        let mut prompt = self.make_prompt()?;
         let store = ClaimStore::with_clock(self.paths.clone(), self.clock.clone());
         let candidates = store
             .resign_candidates(&workspace)
@@ -863,25 +877,61 @@ impl App {
             report: crate::lifecycle::ResignReport,
         }
         if candidates.is_empty() {
+            // Nothing to upgrade; the report still names every claim that
+            // stays untrusted and why.
+            let report = store
+                .resign_approved(&workspace, &[], &excludes)
+                .map_err(|err| CliError::failure(err.to_string()))?;
             return write_json(
                 &mut self.stdout,
                 &ResignOutput {
                     schema_version: 1,
                     workspace,
-                    report: crate::lifecycle::ResignReport::default(),
+                    report,
                 },
             );
         }
+        let mut prompt = self.make_prompt()?;
+        let targets =
+            self.confirm_signing_batch(&mut *prompt, &workspace, "resign", &candidates, &excludes)?;
+        let report = store
+            .resign_approved(&workspace, &targets, &excludes)
+            .map_err(|err| CliError::failure(err.to_string()))?;
+        IndexStore::new(self.paths.clone())
+            .mark_dirty(&workspace)
+            .map_err(|err| CliError::failure(err.to_string()))?;
+        write_json(
+            &mut self.stdout,
+            &ResignOutput {
+                schema_version: 1,
+                workspace,
+                report,
+            },
+        )
+    }
+
+    /// The batch signing ceremony shared by `claim resign` and `key init`:
+    /// list each claim, print the batch action digest bound to the workspace,
+    /// and require its last 16 hex characters. Returns the confirmed targets.
+    fn confirm_signing_batch(
+        &mut self,
+        prompt: &mut dyn ApprovalPrompt,
+        workspace: &str,
+        operation: &str,
+        candidates: &[crate::lifecycle::ResignCandidate],
+        excludes: &[String],
+    ) -> Result<Vec<crate::lifecycle::ResignTarget>, CliError> {
         let to_sign: Vec<&crate::lifecycle::ResignCandidate> = candidates
             .iter()
             .filter(|candidate| !excludes.contains(&candidate.id))
             .collect();
         if to_sign.is_empty() {
-            return Err(CliError::failure(
-                "every approved claim is excluded; nothing to sign",
-            ));
+            return Err(CliError::failure(format!(
+                "every approved claim in workspace {workspace} is excluded; nothing to sign"
+            )));
         }
-        for candidate in &candidates {
+        let _ = writeln!(self.stderr, "workspace: {workspace}");
+        for candidate in candidates {
             let marker = if excludes.contains(&candidate.id) {
                 "excluded"
             } else {
@@ -900,8 +950,8 @@ impl App {
                 canonical_draft_digest: candidate.digest.clone(),
             })
             .collect();
-        // The confirmed (id, digest) pairs are the whole mandate: a claim
-        // written or changed while the prompt waits is skipped, not signed.
+        // The confirmed (id, digest, at, by) tuples are the whole mandate: a
+        // claim written or changed while the prompt waits is skipped.
         let targets: Vec<crate::lifecycle::ResignTarget> = to_sign
             .iter()
             .map(|candidate| crate::lifecycle::ResignTarget {
@@ -913,8 +963,8 @@ impl App {
             .collect();
         let action_digest =
             crate::approval::compute_challenge_action_digest(&crate::approval::ChallengePrepare {
-                workspace: workspace.clone(),
-                operation: "resign".to_string(),
+                workspace: workspace.to_string(),
+                operation: operation.to_string(),
                 items,
                 ..crate::approval::ChallengePrepare::default()
             });
@@ -928,25 +978,12 @@ impl App {
             .read_confirmation()
             .map_err(|err| CliError::failure(err.to_string()))?;
         if confirm.trim() != crate::approval::action_digest_suffix(&action_digest) {
-            return Err(CliError::failure(
-                "claim resign denied: digest suffix mismatch",
-            ));
+            return Err(CliError::failure(format!(
+                "{operation} denied: digest suffix mismatch"
+            )));
         }
         let _ = writeln!(self.stderr);
-        let report = store
-            .resign_approved(&workspace, &targets, &excludes)
-            .map_err(|err| CliError::failure(err.to_string()))?;
-        IndexStore::new(self.paths.clone())
-            .mark_dirty(&workspace)
-            .map_err(|err| CliError::failure(err.to_string()))?;
-        write_json(
-            &mut self.stdout,
-            &ResignOutput {
-                schema_version: 1,
-                workspace,
-                report,
-            },
-        )
+        Ok(targets)
     }
 
     fn run_key(&mut self, args: &[String]) -> Result<(), CliError> {
@@ -979,16 +1016,88 @@ impl App {
             .filter(|arg| arg.as_str() != "--recover")
             .cloned()
             .collect();
-        let parsed = parse_flags(&rest, NO_FLAGS)?;
+        let parsed = parse_flags(&rest, &["exclude"])?;
         if !parsed.rest.is_empty() {
-            return Err(CliError::usage("usage: zbrain key init [--recover]"));
+            return Err(CliError::usage(
+                "usage: zbrain key init [--exclude <id>]... | zbrain key init --recover",
+            ));
         }
+        let excludes = parsed.all("exclude");
         if recover {
+            if !excludes.is_empty() {
+                return Err(CliError::usage("--recover does not take --exclude"));
+            }
             return self.run_key_recover();
         }
-        let report = crate::signing::KeyStore::init(&self.paths, self.clock.now())
+        // Design D (ADR 0002): the key is generated in memory, the owner
+        // confirms every existing approved claim per workspace, the claims
+        // are signed, and the anchor is committed last.
+        let plan = crate::signing::KeyStore::plan_init(&self.paths, self.clock.now())
             .map_err(|err| CliError::failure(err.to_string()))?;
-        self.write_key_init(&report, None)
+        let store = ClaimStore::with_clock(self.paths.clone(), self.clock.clone());
+        let mut batches = Vec::new();
+        for workspace in store
+            .workspace_names()
+            .map_err(|err| CliError::failure(err.to_string()))?
+        {
+            let candidates = store
+                .key_init_candidates(&workspace)
+                .map_err(|err| CliError::failure(err.to_string()))?;
+            if !candidates.is_empty() {
+                batches.push((workspace, candidates));
+            }
+        }
+        if let Some(unknown) = excludes.iter().find(|id| {
+            !batches
+                .iter()
+                .any(|(_, candidates)| candidates.iter().any(|candidate| &candidate.id == *id))
+        }) {
+            return Err(CliError::failure(format!(
+                "--exclude {unknown}: no approved claim with this id"
+            )));
+        }
+        let mut signed = Vec::new();
+        if !batches.is_empty() {
+            let mut prompt = self.make_prompt()?;
+            let _ = writeln!(
+                self.stderr,
+                "key init signs the approved claims below with new key {}; \
+                 confirm only claims you approved",
+                plan.key_id()
+            );
+            let mut confirmed = Vec::new();
+            for (workspace, candidates) in &batches {
+                let workspace_excludes: Vec<String> = excludes
+                    .iter()
+                    .filter(|id| candidates.iter().any(|candidate| &candidate.id == *id))
+                    .cloned()
+                    .collect();
+                if workspace_excludes.len() == candidates.len() {
+                    continue;
+                }
+                let targets = self.confirm_signing_batch(
+                    &mut *prompt,
+                    workspace,
+                    "key-init",
+                    candidates,
+                    &workspace_excludes,
+                )?;
+                confirmed.push((workspace.clone(), targets, workspace_excludes));
+            }
+            for (workspace, targets, workspace_excludes) in confirmed {
+                let report = store
+                    .sign_at_key_init(&workspace, &targets, &workspace_excludes, &plan)
+                    .map_err(|err| CliError::failure(err.to_string()))?;
+                IndexStore::new(self.paths.clone())
+                    .mark_dirty(&workspace)
+                    .map_err(|err| CliError::failure(err.to_string()))?;
+                signed.push(KeyInitWorkspace { workspace, report });
+            }
+        }
+        let report = plan
+            .commit()
+            .map_err(|err| CliError::failure(err.to_string()))?;
+        self.write_key_init(&report, None, signed)
     }
 
     /// Recovery after private-key loss (ADR 0002): the new key is generated
@@ -1025,13 +1134,14 @@ impl App {
         let report = recovery
             .commit()
             .map_err(|err| CliError::failure(err.to_string()))?;
-        self.write_key_init(&report, Some(retired))
+        self.write_key_init(&report, Some(retired), Vec::new())
     }
 
     fn write_key_init(
         &mut self,
         report: &crate::signing::KeyInit,
         retired: Option<Vec<String>>,
+        signed: Vec<KeyInitWorkspace>,
     ) -> Result<(), CliError> {
         #[derive(Serialize)]
         struct KeyInitOutput {
@@ -1045,6 +1155,8 @@ impl App {
             recovered: Option<bool>,
             #[serde(skip_serializing_if = "Option::is_none")]
             retired_key_ids: Option<Vec<String>>,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            signed_claims: Vec<KeyInitWorkspace>,
         }
         let recovered = retired.is_some();
         write_json(
@@ -1058,6 +1170,7 @@ impl App {
                 keys_file: report.keys_file.display().to_string(),
                 recovered: recovered.then_some(true),
                 retired_key_ids: retired,
+                signed_claims: signed,
             },
         )
     }
@@ -1428,7 +1541,7 @@ impl App {
              \x20 view\n\
              \x20 approval show <challenge-id>\n\
              \x20 approval grant <challenge-id>\n\
-             \x20 key init\n\
+             \x20 key init [--exclude <id>]... | key init --recover\n\
              \x20 version\n\
              \n\
              Use `zbrain <command> --help` for command-specific help.\n"
@@ -1515,21 +1628,21 @@ impl App {
     fn print_claim_resign_help(&mut self) {
         let _ = write!(
             self.stdout,
-            "Usage: zbrain claim resign [--workspace <name>] [--exclude <id>]...\n\nRe-sign every approved claim with the active owner key in one TTY ceremony.\nThe command lists each claim's id, title, approval time, and digest, prints\nthe batch action digest, and asks for its last 16 hex characters. Claims\nnamed with --exclude stay unsigned and untrusted. Re-running is a no-op for\nclaims already signed by the active key.\n"
+            "Usage: zbrain claim resign [--workspace <name>] [--exclude <id>]...\n\nUpgrade approved claims that carry a valid pre-release v1 owner signature to\nthe workspace-bound v2 signature, in one TTY ceremony. The command lists each\nclaim's id, title, approval time, and digest, prints the batch action digest,\nand asks for its last 16 hex characters. It never signs a claim without a\nvalid signature, or a v1 claim whose id also exists in another workspace:\nsupersede or revoke those. Re-running is a no-op.\n"
         );
     }
 
     fn print_key_help(&mut self) {
         let _ = write!(
             self.stdout,
-            "Usage:\n  zbrain key init\n\nManage the owner approval key (ADR 0002).\n"
+            "Usage:\n  zbrain key init [--exclude <id>]...\n  zbrain key init --recover\n\nManage the owner approval key (ADR 0002).\n"
         );
     }
 
     fn print_key_init_help(&mut self) {
         let _ = write!(
             self.stdout,
-            "Usage: zbrain key init [--recover]\n\nCreate the owner approval key at $XDG_CONFIG_HOME/zbrain-keys\n(fallback ~/.config/zbrain-keys): directory 0700, files 0600. Refuses a\nsymlinked key path, a path inside ZBRAIN_HOME, looser modes, and an existing\nkey (rotation is a separate ceremony).\n\n--recover  After private-key loss: generate a new key, print its key id, and\n           write it only when the owner types that id. Previous keys are\n           retired, so existing claims keep verifying.\n"
+            "Usage: zbrain key init [--exclude <id>]... | zbrain key init --recover\n\nCreate the owner approval key at $XDG_CONFIG_HOME/zbrain-keys\n(fallback ~/.config/zbrain-keys): directory 0700, files 0600. Refuses a\nsymlinked key path, a path inside ZBRAIN_HOME, looser modes, and an existing\nkey (rotation is a separate ceremony).\n\nWhen approved claims exist, each workspace's claims are listed (id, title,\napproval time, digest) and the owner confirms the batch digest suffix in a\nTTY. Confirmed claims are signed with the new key; claims named with\n--exclude stay unsigned and untrusted. The key is committed last, so a\nrefused or interrupted run writes no key. Run `zbrain migrate okf` first.\n\n--recover  After private-key loss: generate a new key, print its key id, and\n           write it only when the owner types that id. Previous keys are\n           retired, so existing claims keep verifying.\n"
         );
     }
 
