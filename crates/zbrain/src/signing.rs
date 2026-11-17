@@ -28,6 +28,7 @@ use crate::yaml::{self, Yaml};
 
 pub const APPROVAL_ALGORITHM: &str = "ed25519";
 pub const APPROVAL_SIGNING_DOMAIN: &str = "zbrain.approval/v1";
+pub const GRANT_SIGNING_DOMAIN: &str = "zbrain.grant/v1";
 pub const KEY_DIR_NAME: &str = "zbrain-keys";
 pub const PRIVATE_KEY_FILE: &str = "approval.ed25519";
 pub const PUBLIC_KEY_FILE: &str = "approval.pub";
@@ -476,6 +477,51 @@ pub fn verify_claim_signature(claim: &Claim, store: &KeyStore) -> Result<(), Key
                 claim.id
             ))
         })
+}
+
+fn grant_message(fields: &[&str], key_id: &str) -> Vec<u8> {
+    let mut message = String::from(GRANT_SIGNING_DOMAIN);
+    for field in fields.iter().copied().chain([key_id]) {
+        message.push('\n');
+        message.push_str(field);
+    }
+    message.into_bytes()
+}
+
+/// Sign an owner grant with the active key. `fields` must not contain
+/// newlines; the caller fixes their order. Returns `(key_id, sig)`.
+pub fn sign_grant(store: &KeyStore, fields: &[&str]) -> Result<(String, String), KeyError> {
+    if fields.iter().any(|field| field.contains('\n')) {
+        return Err(KeyError::new("grant field contains a newline"));
+    }
+    let (key_id, signing_key) = store.active_signing_key()?;
+    let signature = signing_key.sign(&grant_message(fields, &key_id));
+    Ok((key_id, BASE64.encode(signature.to_bytes())))
+}
+
+/// Verify an owner grant. Only the active key is accepted: a grant lives for
+/// minutes, so a retired or revoked key never has a reason to sign one.
+pub fn verify_grant(
+    store: &KeyStore,
+    fields: &[&str],
+    key_id: &str,
+    sig: &str,
+) -> Result<(), KeyError> {
+    if key_id.is_empty() || sig.is_empty() {
+        return Err(KeyError::new("grant carries no owner signature"));
+    }
+    if fields.iter().any(|field| field.contains('\n')) {
+        return Err(KeyError::new("grant field contains a newline"));
+    }
+    let key = store
+        .keys
+        .iter()
+        .find(|key| key.key_id == key_id && key.state == "active")
+        .ok_or_else(|| KeyError::new(format!("grant is signed by non-active key {key_id}")))?;
+    let signature = decode_signature(sig)?;
+    key.public_key
+        .verify_strict(&grant_message(fields, key_id), &signature)
+        .map_err(|_| KeyError::new("grant signature does not verify"))
 }
 
 /// Verify one claim against the anchor at `paths.key_dir`.
