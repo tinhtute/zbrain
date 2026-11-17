@@ -1,6 +1,23 @@
 # CHANGELOG
 
-## Unreleased
+## 0.5.0 (2026-11-17) — signed approvals and trust hardening
+
+Closes the nine trust breaks from the 2026-11-09 audit
+(`docs/audit/2026-11-09/`). Approved claims now need the owner's signature.
+
+### Upgrade (do this first)
+1. `zbrain migrate okf` — only if a workspace still holds pre-OKF claims.
+   Claims migrated after key init have no signing path.
+2. `zbrain key init` — create the owner key outside the runtime root and sign
+   existing approved claims in one batch owner ceremony per workspace
+   (`--exclude <id>` skips one). The key is written last, so a cancelled run
+   leaves nothing behind.
+3. `zbrain claim resign` — only if you ran a pre-release `key init`; upgrades
+   v1 signatures to the workspace-bound v2.
+4. `zbrain reindex`; `zbrain doctor` reports no unsigned approved claim.
+
+Until step 2 runs, every existing approved claim is untrusted and `ask`
+answers `gap` or fails closed.
 
 ### Changed (breaking: approved claims now require an owner signature)
 - An approved claim is trusted only when it carries an Ed25519 signature over
@@ -66,7 +83,7 @@
   approval requires confirming the last 16 hex characters of the action digest
   on an interactive TTY — the same challenge/grant path as `approval grant`.
   The TTY check is owner-presence friction, not a security boundary: any pty
-  passes it, and owner proof is the planned signed-approval work. `make smoke`
+  passes it; owner proof is the signature above. `make smoke`
   and the audit repros drive the real ceremony through
   `scripts/owner-approve.py`.
 - Plain `ask` (and MCP `memory_ask`) now applies `stale_after` the same way
@@ -94,6 +111,13 @@
   fixes, so moving the file is not presented as the whole fix. The count is
   taken from the wiki as it is now, so it stays right when files are added or
   moved after the rejected rebuild.
+
+### Security
+- `rusqlite` 0.32 → 0.41 (bundled SQLite) for RUSTSEC-2026-0459.
+
+### Notes
+- 100k-claim corpus `ask` p95 proof recorded with a release build
+  (`crates/zbrain/tests/bench_100k.rs`).
 
 ## 0.4.0 (2026-09-06) — Rust cutover
 

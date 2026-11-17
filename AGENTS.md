@@ -5,7 +5,7 @@ Rust (stable toolchain via `rust-toolchain.toml`), Rust-native CLI in `crates/zb
 ## Layout
 
 - `crates/zbrain/src/main.rs` — binary entrypoint (thin dispatch, delegates to `cli`)
-- `crates/zbrain/src/cli.rs` — arg parsing, dispatch, JSON/text output; version `0.3.0`
+- `crates/zbrain/src/cli.rs` — arg parsing, dispatch, JSON/text output; version `0.5.0`
 - `crates/zbrain/src/` — durable logic: paths, config, assets, setup, workspace, claims, evidence, lifecycle, transition, trust validation, lint, index (FTS5 via rusqlite bundled), query, embedder, approval, campaign; unit tests alongside each module
 - `crates/zbrain/src/mcp/` — stdio MCP gateway (hand-rolled JSON-RPC)
 - `crates/zbrain/src/view.rs` — loopback viewer (std TcpListener)

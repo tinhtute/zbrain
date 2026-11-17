@@ -23,7 +23,7 @@ use crate::setup::run_setup;
 use crate::term::{ApprovalPrompt, StdinPrompt};
 use crate::workspace::{create_workspace, marshal_current, resolve_current_workspace};
 
-pub const VERSION: &str = "0.4.0";
+pub const VERSION: &str = "0.5.0";
 
 /// CLI failure modes mirror Go's `commandExitError`: usage problems exit 2,
 /// unknown commands/subcommands and runtime failures exit 1.
