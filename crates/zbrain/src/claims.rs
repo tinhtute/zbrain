@@ -1872,7 +1872,7 @@ impl ClaimStore {
                 continue;
             }
             let signature = match &anchor {
-                Some(Ok(store)) => crate::signing::verify_claim_signature(claim, store),
+                Some(Ok(store)) => crate::signing::verify_claim_signature(claim, workspace, store),
                 Some(Err(err)) => Err(err.clone()),
                 None => Ok(()),
             }
@@ -1940,7 +1940,9 @@ impl ClaimStore {
             .claims
             .iter()
             .filter(|claim| claim.status == CLAIM_STATUS_APPROVED)
-            .filter(|claim| crate::signing::verify_claim_signature(claim, &store).is_err())
+            .filter(|claim| {
+                crate::signing::verify_claim_signature(claim, workspace, &store).is_err()
+            })
             .map(|claim| claim.id.clone())
             .collect();
         ids.sort();

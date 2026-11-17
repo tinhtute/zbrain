@@ -83,7 +83,7 @@ fn ask_p95_bench() {
     let build_start = Instant::now();
     for index in 0..corpus_size {
         let mut claim = bench_claim(index);
-        zbrain::signing::sign_claim(&mut claim, &keys).expect("sign bench claim");
+        zbrain::signing::sign_claim(&mut claim, "research", &keys).expect("sign bench claim");
         let path = projects_dir.join(format!("{}.md", claim.id));
         write_claim_atomic(&path, &claim).expect("write bench claim");
     }

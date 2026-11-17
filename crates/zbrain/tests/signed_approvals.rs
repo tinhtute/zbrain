@@ -608,3 +608,87 @@ fn resign_refuses_a_claim_whose_approval_time_or_approver_changed() {
         );
     }
 }
+
+/// Security review before v0.5.0, finding 2: the signature must bind the
+/// workspace, or a signed claim copied into another workspace stays trusted.
+#[test]
+fn signed_claim_copied_into_another_workspace_is_rejected() {
+    let fx = fixture("cross-workspace");
+    let mut cli = Cli::new(fx.paths.clone());
+    cli.run_ok(&["key", "init"]);
+    let id = draft(&mut cli, "Agent fact", "cross workspace replay answer\n");
+    approve_via_cli(&mut cli, &id);
+
+    create_workspace(
+        &fx.paths,
+        "other",
+        &FixedClock::new(Utc.with_ymd_and_hms(2026, 8, 1, 9, 0, 0).unwrap()),
+    )
+    .unwrap();
+    let copy = fx
+        .paths
+        .workspaces_dir
+        .join("other/wiki/projects")
+        .join(format!("{id}.md"));
+    std::fs::copy(claim_path(&fx, &id), &copy).unwrap();
+
+    let summary = IndexStore::new(fx.paths.clone()).rebuild("other").unwrap();
+    assert_eq!(summary.approved, 0, "{summary:?}");
+    assert!(summary.invalid >= 1, "{summary:?}");
+    assert_eq!(summary.rebuild_state, REBUILD_STATUS_REJECTED);
+
+    // The original stays trusted in its own workspace.
+    let summary = IndexStore::new(fx.paths.clone())
+        .rebuild("research")
+        .unwrap();
+    assert_eq!(summary.approved, 1, "{summary:?}");
+    assert_eq!(summary.invalid, 0, "{summary:?}");
+}
+
+/// The v2 signature binds the claim's own workspace, so a secondary
+/// workspace read with `--include` must verify against that workspace.
+#[test]
+fn included_workspace_claim_verifies_against_its_own_workspace() {
+    use zbrain::approval::{action_digest_suffix, compute_challenge_action_digest};
+    use zbrain::claims::ClaimStore;
+    let fx = fixture("include");
+    let mut cli = Cli::new(fx.paths.clone());
+    cli.run_ok(&["key", "init"]);
+    cli.run_ok(&["workspace", "create", "other"]);
+    cli.app.stdin = Box::new(Cursor::new(b"secondary included answer\n".to_vec()));
+    let out = cli.run_ok(&[
+        "claim",
+        "draft",
+        "--tier",
+        "projects",
+        "--title",
+        "Other fact",
+        "--basis",
+        "owner",
+        "--workspace",
+        "other",
+    ]);
+    let id = serde_json::from_str::<serde_json::Value>(&out).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let store = ClaimStore::with_clock(cli.app.paths.clone(), cli.app.clock.clone());
+    let prepare = store.approve_challenge_prepare("other", &id).unwrap();
+    let suffix = action_digest_suffix(&compute_challenge_action_digest(&prepare)).to_string();
+    cli.app.prompt = PromptSource::Scripted(vec![suffix]);
+    cli.run_ok(&["claim", "approve", &id, "--workspace", "other"]);
+    cli.run_ok(&["reindex", "--workspace", "other"]);
+    cli.run_ok(&["reindex", "--workspace", "research"]);
+
+    let asked: serde_json::Value = serde_json::from_str(&cli.run_ok(&[
+        "ask",
+        "secondary included",
+        "--workspace",
+        "research",
+        "--include",
+        "other",
+    ]))
+    .unwrap();
+    assert_eq!(asked["status"], "ready", "{asked}");
+    assert_eq!(asked["claims"][0]["id"], id.as_str(), "{asked}");
+}

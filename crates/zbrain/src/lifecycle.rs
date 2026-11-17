@@ -190,7 +190,7 @@ impl ClaimStore {
         // invalid key fails before the challenge token is consumed.
         let keys = crate::signing::KeyStore::open(&self.paths)
             .map_err(|err| message(format!("approval signing key unavailable: {err}")))?;
-        crate::signing::sign_claim(&mut claim, &keys)
+        crate::signing::sign_claim(&mut claim, workspace, &keys)
             .map_err(|err| message(format!("sign approved claim: {err}")))?;
 
         for old in &mut old_claims {
@@ -310,7 +310,7 @@ impl ClaimStore {
                 continue;
             }
             let mut signed = claim.clone();
-            crate::signing::sign_claim(&mut signed, &keys)
+            crate::signing::sign_claim(&mut signed, workspace, &keys)
                 .map_err(|err| message(format!("sign claim {}: {err}", claim.id)))?;
             if signed.verified_alg == claim.verified_alg
                 && signed.verified_key_id == claim.verified_key_id

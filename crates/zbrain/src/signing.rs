@@ -27,7 +27,12 @@ use crate::paths::{absolute, Paths};
 use crate::yaml::{self, Yaml};
 
 pub const APPROVAL_ALGORITHM: &str = "ed25519";
-pub const APPROVAL_SIGNING_DOMAIN: &str = "zbrain.approval/v1";
+/// Current approval message domain. v2 binds the workspace so a signed claim
+/// copied into another workspace does not verify there.
+pub const APPROVAL_SIGNING_DOMAIN: &str = "zbrain.approval/v2";
+/// Pre-release message without the workspace. Accepted only by
+/// `claim resign` as proof for the v1 -> v2 upgrade, never for trust.
+pub const APPROVAL_SIGNING_DOMAIN_V1: &str = "zbrain.approval/v1";
 pub const GRANT_SIGNING_DOMAIN: &str = "zbrain.grant/v1";
 pub const KEY_DIR_NAME: &str = "zbrain-keys";
 pub const PRIVATE_KEY_FILE: &str = "approval.ed25519";
@@ -122,17 +127,27 @@ pub fn key_id_for(public_key: &VerifyingKey) -> String {
         .collect()
 }
 
-/// The byte-exact approval message: domain, claim id, verification digest,
-/// approval time, approver, and key id, one per line after the domain.
-pub fn approval_message(claim: &Claim, key_id: &str) -> Vec<u8> {
-    let mut message = String::from(APPROVAL_SIGNING_DOMAIN);
-    for field in [
+/// The byte-exact approval message: domain, workspace, claim id,
+/// verification digest, approval time, approver, and key id, one per line
+/// after the domain.
+pub fn approval_message(claim: &Claim, workspace: &str, key_id: &str) -> Vec<u8> {
+    message_lines(APPROVAL_SIGNING_DOMAIN, Some(workspace), claim, key_id)
+}
+
+/// The v1 message: as v2 but without the workspace line.
+pub fn approval_message_v1(claim: &Claim, key_id: &str) -> Vec<u8> {
+    message_lines(APPROVAL_SIGNING_DOMAIN_V1, None, claim, key_id)
+}
+
+fn message_lines(domain: &str, workspace: Option<&str>, claim: &Claim, key_id: &str) -> Vec<u8> {
+    let mut message = String::from(domain);
+    for field in workspace.into_iter().chain([
         claim.id.as_str(),
         claim.verified_digest.as_str(),
         claim.verified_at.as_str(),
         claim.verified_by.as_str(),
         key_id,
-    ] {
+    ]) {
         message.push('\n');
         message.push_str(field);
     }
@@ -415,7 +430,7 @@ fn init_key_dir(dir: &Path, runtime_dir: &Path, now: DateTime<Utc>) -> Result<Ke
 }
 
 /// Sign the claim's current verified block with the active owner key.
-pub fn sign_claim(claim: &mut Claim, store: &KeyStore) -> Result<(), KeyError> {
+pub fn sign_claim(claim: &mut Claim, workspace: &str, store: &KeyStore) -> Result<(), KeyError> {
     if claim.verified_at.is_empty()
         || claim.verified_by.is_empty()
         || claim.verified_digest.is_empty()
@@ -424,8 +439,11 @@ pub fn sign_claim(claim: &mut Claim, store: &KeyStore) -> Result<(), KeyError> {
             "claim has no verified block to sign; compute the digest first",
         ));
     }
+    if workspace.is_empty() || workspace.contains('\n') {
+        return Err(KeyError::new("approval needs a single-line workspace name"));
+    }
     let (key_id, signing_key) = store.active_signing_key()?;
-    let message = approval_message(claim, &key_id);
+    let message = approval_message(claim, workspace, &key_id);
     let signature = signing_key.sign(&message);
     claim.verified_alg = APPROVAL_ALGORITHM.to_string();
     claim.verified_key_id = key_id;
@@ -433,8 +451,30 @@ pub fn sign_claim(claim: &mut Claim, store: &KeyStore) -> Result<(), KeyError> {
     Ok(())
 }
 
-/// Verify the claim's recorded signature against the anchor.
-pub fn verify_claim_signature(claim: &Claim, store: &KeyStore) -> Result<(), KeyError> {
+/// Verify the claim's recorded signature against the anchor, bound to the
+/// workspace the claim was read from.
+pub fn verify_claim_signature(
+    claim: &Claim,
+    workspace: &str,
+    store: &KeyStore,
+) -> Result<(), KeyError> {
+    verify_claim_with(claim, store, |key_id| {
+        approval_message(claim, workspace, key_id)
+    })
+}
+
+/// Verify a pre-release v1 signature (no workspace binding). Only
+/// `claim resign` uses this, as proof the owner key already approved this
+/// exact verified block; it never makes a claim trusted.
+pub fn verify_claim_signature_v1(claim: &Claim, store: &KeyStore) -> Result<(), KeyError> {
+    verify_claim_with(claim, store, |key_id| approval_message_v1(claim, key_id))
+}
+
+fn verify_claim_with(
+    claim: &Claim,
+    store: &KeyStore,
+    message_for: impl Fn(&str) -> Vec<u8>,
+) -> Result<(), KeyError> {
     if claim.verified_alg.is_empty()
         && claim.verified_key_id.is_empty()
         && claim.verified_sig.is_empty()
@@ -468,7 +508,7 @@ pub fn verify_claim_signature(claim: &Claim, store: &KeyStore) -> Result<(), Key
         })?;
     key_allows_at(key, &claim.verified_at)?;
     let signature = decode_signature(&claim.verified_sig)?;
-    let message = approval_message(claim, &key.key_id);
+    let message = message_for(&key.key_id);
     key.public_key
         .verify_strict(&message, &signature)
         .map_err(|_| {
@@ -525,9 +565,13 @@ pub fn verify_grant(
 }
 
 /// Verify one claim against the anchor at `paths.key_dir`.
-pub fn verify_claim_signature_at(paths: &Paths, claim: &Claim) -> Result<(), KeyError> {
+pub fn verify_claim_signature_at(
+    paths: &Paths,
+    workspace: &str,
+    claim: &Claim,
+) -> Result<(), KeyError> {
     let store = KeyStore::open(paths)?;
-    verify_claim_signature(claim, &store)
+    verify_claim_signature(claim, workspace, &store)
 }
 
 fn key_allows_at(key: &AnchorKey, verified_at: &str) -> Result<(), KeyError> {
@@ -855,15 +899,21 @@ pub(crate) fn test_key_store() -> KeyStore {
         .clone()
 }
 
-/// Sign an approved claim built by a test with the process-wide test key.
+/// Sign an approved claim built by a test for the `research` workspace with
+/// the process-wide test key.
 #[cfg(test)]
 pub(crate) fn sign_test_claim(claim: &mut Claim) {
+    sign_test_claim_in(claim, "research");
+}
+
+#[cfg(test)]
+pub(crate) fn sign_test_claim_in(claim: &mut Claim, workspace: &str) {
     let store = test_key_store();
     if claim.verified_digest.is_empty() {
         claim.verified_digest = crate::claims::claim_verification_digest(claim)
             .expect("test claim verification digest");
     }
-    sign_claim(claim, &store).expect("sign test claim");
+    sign_claim(claim, workspace, &store).expect("sign test claim");
 }
 
 #[cfg(test)]
@@ -940,7 +990,7 @@ mod tests {
     }
 
     fn sign_with(claim: &mut Claim, signing_key: &SigningKey, key_id: &str) {
-        let message = approval_message(claim, key_id);
+        let message = approval_message(claim, "research", key_id);
         claim.verified_alg = APPROVAL_ALGORITHM.into();
         claim.verified_key_id = key_id.into();
         claim.verified_sig = BASE64.encode(signing_key.sign(&message).to_bytes());
@@ -964,12 +1014,18 @@ mod tests {
     #[test]
     fn approval_message_is_byte_exact() {
         let claim = approved_claim();
-        let message = approval_message(&claim, "a1b2c3d4e5f60718");
+        let message = approval_message(&claim, "research", "a1b2c3d4e5f60718");
         let expected = format!(
-            "zbrain.approval/v1\n{CLAIM_ID}\n{}\n2026-11-12T10:00:00Z\nowner\na1b2c3d4e5f60718",
+            "zbrain.approval/v2\nresearch\n{CLAIM_ID}\n{}\n2026-11-12T10:00:00Z\nowner\na1b2c3d4e5f60718",
             claim.verified_digest
         );
         assert_eq!(String::from_utf8(message).unwrap(), expected);
+        let v1 = approval_message_v1(&claim, "a1b2c3d4e5f60718");
+        let expected_v1 = format!(
+            "zbrain.approval/v1\n{CLAIM_ID}\n{}\n2026-11-12T10:00:00Z\nowner\na1b2c3d4e5f60718",
+            claim.verified_digest
+        );
+        assert_eq!(String::from_utf8(v1).unwrap(), expected_v1);
     }
 
     #[test]
@@ -980,7 +1036,7 @@ mod tests {
         let legacy = render_claim_markdown(&claim).unwrap();
         KeyStore::init(&fx.paths, now()).unwrap();
         let store = KeyStore::open(&fx.paths).unwrap();
-        sign_claim(&mut claim, &store).unwrap();
+        sign_claim(&mut claim, "research", &store).unwrap();
         assert_eq!(claim_verification_digest(&claim).unwrap(), before);
         assert_eq!(claim.verified_digest, before);
         assert_eq!(store.keys()[0].key_id, claim.verified_key_id);
@@ -1002,7 +1058,7 @@ mod tests {
         KeyStore::init(&fx.paths, now()).unwrap();
         let store = KeyStore::open(&fx.paths).unwrap();
         let mut claim = approved_claim();
-        sign_claim(&mut claim, &store).unwrap();
+        sign_claim(&mut claim, "research", &store).unwrap();
         let rendered = render_claim_markdown(&claim).unwrap();
         let parsed =
             parse_claim_markdown("projects", &format!("projects/{CLAIM_ID}.md"), &rendered)
@@ -1011,7 +1067,7 @@ mod tests {
         assert_eq!(parsed.verified_key_id, claim.verified_key_id);
         assert_eq!(parsed.verified_sig, claim.verified_sig);
         assert_eq!(parsed.verified_digest, claim.verified_digest);
-        verify_claim_signature(&parsed, &store).unwrap();
+        verify_claim_signature(&parsed, "research", &store).unwrap();
     }
 
     #[test]
@@ -1128,11 +1184,11 @@ mod tests {
         KeyStore::init(&fx.paths, now()).unwrap();
         let store = KeyStore::open(&fx.paths).unwrap();
         let mut claim = approved_claim();
-        sign_claim(&mut claim, &store).unwrap();
+        sign_claim(&mut claim, "research", &store).unwrap();
         let mut bytes = BASE64.decode(&claim.verified_sig).unwrap();
         bytes[0] ^= 0xff;
         claim.verified_sig = BASE64.encode(bytes);
-        let error = verify_claim_signature(&claim, &store).unwrap_err();
+        let error = verify_claim_signature(&claim, "research", &store).unwrap_err();
         assert!(error.to_string().contains("does not verify"), "{error}");
     }
 
@@ -1145,7 +1201,7 @@ mod tests {
         let other = SigningKey::generate(&mut rand_core::OsRng);
         let other_id = key_id_for(&other.verifying_key());
         sign_with(&mut claim, &other, &other_id);
-        let error = verify_claim_signature(&claim, &store).unwrap_err();
+        let error = verify_claim_signature(&claim, "research", &store).unwrap_err();
         assert!(error.to_string().contains("unknown key"), "{error}");
     }
 
@@ -1155,7 +1211,7 @@ mod tests {
         KeyStore::init(&fx.paths, now()).unwrap();
         let store = KeyStore::open(&fx.paths).unwrap();
         let claim = approved_claim();
-        let error = verify_claim_signature(&claim, &store).unwrap_err();
+        let error = verify_claim_signature(&claim, "research", &store).unwrap_err();
         assert!(error.to_string().contains("unsigned"), "{error}");
         assert!(error.to_string().contains("zbrain claim resign"), "{error}");
     }
@@ -1172,10 +1228,10 @@ mod tests {
             &signing_key_from_disk(&fx.paths),
             &report.key_id,
         );
-        verify_claim_signature(&claim, &store).unwrap();
+        verify_claim_signature(&claim, "research", &store).unwrap();
 
         claim.verified_at = "2026-11-12T12:00:00Z".into();
-        let error = verify_claim_signature(&claim, &store).unwrap_err();
+        let error = verify_claim_signature(&claim, "research", &store).unwrap_err();
         assert!(error.to_string().contains("retired"), "{error}");
     }
 
@@ -1195,11 +1251,11 @@ mod tests {
         // Signed before the revocation instant: still untrusted, because a
         // compromised key can backdate. ADR 0002 "Compromise".
         claim.verified_at = "2026-11-12T10:00:00Z".into();
-        let error = verify_claim_signature(&claim, &store).unwrap_err();
+        let error = verify_claim_signature(&claim, "research", &store).unwrap_err();
         assert!(error.to_string().contains("revoked"), "{error}");
 
         claim.verified_at = "2026-11-12T11:00:00Z".into();
-        let error = verify_claim_signature(&claim, &store).unwrap_err();
+        let error = verify_claim_signature(&claim, "research", &store).unwrap_err();
         assert!(error.to_string().contains("revoked"), "{error}");
     }
 
@@ -1240,7 +1296,8 @@ mod tests {
         assert_eq!(committed.key_id, new_key_id);
 
         let store = KeyStore::open(&fx.paths).unwrap();
-        verify_claim_signature(&claim, &store).expect("retired key keeps old claims valid");
+        verify_claim_signature(&claim, "research", &store)
+            .expect("retired key keeps old claims valid");
         let (active_id, _) = store.active_signing_key().unwrap();
         assert_eq!(active_id, new_key_id);
         assert_eq!(store.keys().len(), 2);
@@ -1308,7 +1365,8 @@ mod tests {
             assert_eq!(rerun.key_id(), new_key_id);
             rerun.commit().unwrap();
             let store = KeyStore::open(&fx.paths).unwrap();
-            verify_claim_signature(&claim, &store).expect("the retired key keeps the old claim");
+            verify_claim_signature(&claim, "research", &store)
+                .expect("the retired key keeps the old claim");
             assert_eq!(store.active_signing_key().unwrap().0, new_key_id);
         }
     }

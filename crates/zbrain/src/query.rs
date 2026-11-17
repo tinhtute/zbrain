@@ -636,7 +636,7 @@ fn validate_indexed_claim_binding_internal(
             indexed.id
         ))
     })?;
-    crate::signing::verify_claim_signature_at(paths, &canonical).map_err(|err| {
+    crate::signing::verify_claim_signature_at(paths, workspace, &canonical).map_err(|err| {
         IndexError::Message(format!(
             "approved claim {:?} approval signature failed: {err}",
             indexed.id
@@ -789,7 +789,7 @@ fn verify_claim_trust_at(
     if digest != claim.verified_digest {
         return Err(format!("claim {:?} verification digest mismatch", claim.id));
     }
-    crate::signing::verify_claim_signature_at(paths, claim)
+    crate::signing::verify_claim_signature_at(paths, workspace, claim)
         .map_err(|err| format!("claim {:?} approval signature: {err}", claim.id))?;
     if !approved.evidence_ids.is_empty() {
         let mut evidence_validator =
